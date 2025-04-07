@@ -1,0 +1,11 @@
+audio/id*
+audio/202*
+test.py
+*.csv
+.git  
+*.tmp  
+*.log  
+deb
+common_voice_speakers
+tmp/*
+

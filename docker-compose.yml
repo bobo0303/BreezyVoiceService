@@ -1,0 +1,29 @@
+version: '3.8'  
+  
+services:  
+  bv_service:  
+    image: bv_service:v0.1.1
+    runtime: nvidia  
+    shm_size: 32G  
+    deploy:  
+      resources:  
+        reservations:  
+          devices:  
+            - capabilities: [gpu]  
+    devices:  
+      - /dev/nvidia-uvm:/dev/nvidia-uvm  
+      - /dev/nvidia-uvm-tools:/dev/nvidia-uvm-tools  
+      - /dev/nvidiactl:/dev/nvidiactl  
+      - /dev/nvidia0:/dev/nvidia0  
+    ports:  
+      - "52010:80"  
+    volumes:  
+      - /userdata/bobo/BreezyVoice:/mnt2  
+      - /userdata/bobo/BreezyVoice_service:/mnt  
+      - /userdata/bobo/BreezyVoice_service/tmp:/tmp  
+    stdin_open: true  
+    tty: true  
+
+
+# docker-compose up -d  
+# docker run -d -it --gpus all --shm-size 32G --runtime nvidia --device=/dev/nvidia-uvm --device=/dev/nvidia-uvm-tools --device=/dev/nvidiactl --device=/dev/nvidia0 --name bv_service -p 52010:80 -v /userdata/bobo/BreezyVoice:/mnt2 -v /userdata/bobo/BreezyVoice_service:/mnt -v /userdata/bobo/BreezyVoice_service/tmp:/tmp bv_service:lastest bash  
