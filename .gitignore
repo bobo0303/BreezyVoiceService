@@ -7,6 +7,7 @@ audio/202*
 tmp/*
 common_voice_speakers/*
 G2PWModel/*
+logs/*
 
 # Byte-compiled / optimized / DLL files  
 __pycache__/  
