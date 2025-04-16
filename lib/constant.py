@@ -3,6 +3,7 @@ from pydantic import BaseModel
 import torch
 
 SPEAKERFOLDER = "common_voice_speakers"
+SPEAKERS = "common_voice_speakers/common_voice_speakers.json"
 OUTPUTPATH = "/tmp/audio_output/"
 TASKPAIR = "/tmp/task_pair.json"
 CSV_TMP = "/tmp/csv_folder"  

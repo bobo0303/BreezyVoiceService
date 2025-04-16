@@ -2,8 +2,10 @@ from fastapi import FastAPI, UploadFile, File, Form
 from fastapi.responses import FileResponse  
 import os  
 import csv  
+import json
 import pytz  
 import time  
+import random
 import shutil  
 import signal  
 import uvicorn  
@@ -15,7 +17,8 @@ from api.batch_inference import AudioGenerate
 from api.threading_api import process_batch_task, quality_checking_task  
 from api.whisper_api import Model  
 from api.utils import load_file_list, zip_wav_files  
-from lib.constant import OUTPUTPATH, CSV_TMP, CSV_HEADER_FORMAT, SPEAKERFOLDER, QUALITY_PASS_TXT, QUALITY_FAIL_TXT  
+
+from lib.constant import OUTPUTPATH, CSV_TMP, CSV_HEADER_FORMAT, SPEAKERFOLDER, SPEAKERS, QUALITY_PASS_TXT, QUALITY_FAIL_TXT  
 from lib.base_object import BaseResponse  
 from lib.log_config import setup_sys_logging  
   
@@ -148,7 +151,7 @@ def audio_quantity(task_id: str):
       
     keep_num = len(load_file_list(passed_list))  
     delete_num = len(load_file_list(failed_list))  
-    unprocessed_num = audio_count - keep_num - delete_num  
+    unprocessed_num = audio_count - keep_num  
       
     if audio_generator.task_flags.get(task_id) or model.task_flags.get(task_id):  
         state = "running"  
@@ -384,6 +387,52 @@ def zip_audio(task_id: str):
     end = time.time()  
     logger.info(f" | ZIP archive {task_id}.zip completed. zip time: {end-start} | ")  
     return BaseResponse(status="OK", message=f" | ZIP archive {task_id}.zip completed. zip time: {end-start} | ", data=True)  
+
+##############################################################################
+
+@app.post("/txt2csv")  
+def txt2csv(file: UploadFile = File(...), expansion_ratio: float = 1.0):  
+    # Load the text sample to be generated  
+    logger.info(f" | Start to load text sample | ")  
+      
+    if file.filename.endswith(".txt"):  
+        texts = file.file.read().decode('utf-8').splitlines()  
+        text_num = len(texts)  
+    else:  
+        logger.info(f" | We only support txt file | ")  
+        return BaseResponse(status="FAILED", message=f" | We only support txt file | ", data=False)  
+  
+    # Load speakers  
+    logger.info(f" | Start to load speakers | ")  
+    with open(SPEAKERS, 'r') as speakers_file:  
+        speakers = json.load(speakers_file)  
+        speaker_num = len(speakers)  
+  
+    # Extend data  
+    total_num = int(text_num * expansion_ratio)  
+    random.shuffle(texts)  
+    extended_texts = (texts * ((total_num // text_num) + 1))[:total_num]  
+    random.shuffle(speakers)  
+    extended_speakers = (speakers * ((total_num // speaker_num) + 1))[:total_num]  
+  
+    # Write into CSV format  
+    logger.info(f" | Start to write into csv format | ")  
+    try:  
+        csv_filename = os.path.join(CSV_TMP, file.filename.replace(".txt", ".csv"))  
+        with open(csv_filename, 'w', newline='') as csv_file:  
+            writer = csv.writer(csv_file)  
+            writer.writerow(CSV_HEADER_FORMAT)
+            for index, (speaker, text) in enumerate(zip(extended_speakers, extended_texts)):   
+                writer.writerows([  
+                    [speaker['audio'].replace(".wav",""), speaker['audio'].replace(".wav",""), speaker['sentence'], text, speaker['audio'].rsplit('.', 1)[0] + '_' + str(index+1)]  
+                ])  
+    except Exception as e:  
+        logger.error(f" | Something wrong when writing csv: {e} | ")  
+        return BaseResponse(status="FAILED", message=f" | Something wrong when writing csv: {e} | ", data=False)  
+  
+    logger.info(f" | Generate csv file successful | ")  
+    return FileResponse(csv_filename, media_type='application/csv', filename=file.filename.replace(".txt", ".csv"))  
+    
   
 ##############################################################################  
   
