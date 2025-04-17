@@ -1,5 +1,6 @@
 from fastapi import FastAPI, UploadFile, File, Form  
 from fastapi.responses import FileResponse  
+import io
 import os  
 import csv  
 import json
@@ -8,6 +9,7 @@ import time
 import random
 import shutil  
 import signal  
+import zipfile  
 import uvicorn  
 import threading  
 from threading import Thread, Event  
@@ -18,7 +20,7 @@ from api.threading_api import process_batch_task, quality_checking_task
 from api.whisper_api import Model  
 from api.utils import load_file_list, zip_wav_files  
 
-from lib.constant import OUTPUTPATH, CSV_TMP, CSV_HEADER_FORMAT, SPEAKERFOLDER, SPEAKERS, QUALITY_PASS_TXT, QUALITY_FAIL_TXT  
+from lib.constant import OUTPUTPATH, CSV_TMP, CSV_HEADER_FORMAT, SPEAKERFOLDER, CUSTOMSPEAKERPATH, SPEAKERS, QUALITY_PASS_TXT, QUALITY_FAIL_TXT  
 from lib.base_object import BaseResponse  
 from lib.log_config import setup_sys_logging  
   
@@ -159,18 +161,88 @@ def audio_quantity(task_id: str):
     else:  
         state = "stopped"  
         logger.info(f" | Task is stopped. | task ID: {task_id} | ")  
-      
-    logger.info(f" | Task {task_id} total audio is {audio_count} | keep: {keep_num} | del: {delete_num} | unprocessed: {unprocessed_num} | ")  
+        
+    csv_file_path = os.path.join(CSV_TMP, task_id + ".csv")  
+    with open(csv_file_path, mode='r', encoding='utf-8') as file:  
+        reader = csv.reader(file)  
+        next(reader, None)  
+        total_audio = sum(1 for row in reader) 
+    progress = round(audio_count / total_audio * 100, 2)  
+
+    logger.info(f" | Task {task_id} now audio is {audio_count} | progress: {progress}% | keep: {keep_num} | del: {delete_num} | unprocessed: {unprocessed_num} | ")  
     return_info = {  
         "task_id": task_id,  
         "state": state,  
+        "progress": str(progress)+"%",
         "audio_count": audio_count,  
         "keep": keep_num,  
         "delete": delete_num,  
         "unprocessed": unprocessed_num  
     }  
       
-    return BaseResponse(status="OK", message=f" | Task {task_id} is {state}. | total audio: {audio_count} | keep: {keep_num} | del: {delete_num} | unprocessed: {unprocessed_num} | ", data=return_info)  
+    return BaseResponse(status="OK", message=f" | Task {task_id} is {state}. | progress: {progress}% | not audio: {audio_count} | keep: {keep_num} | del: {delete_num} | unprocessed: {unprocessed_num} | ", data=return_info)  
+  
+@app.post("/custom_speaker_upload")  
+async def custom_speaker_upload(task_id: str, file: UploadFile = File(...)):  
+    logger.info(f" | Start to create task '{task_id}' custom speakers  | ")  
+    file_content = await file.read()  
+  
+    try:  
+        with zipfile.ZipFile(io.BytesIO(file_content)) as zip_file:  
+            zip_file_contents = zip_file.namelist()  
+            wav_files = [file for file in zip_file_contents if file.endswith('.wav')]  
+            json_files = [file for file in zip_file_contents if file.endswith('.json')]  
+  
+            if len(json_files) != 1:  
+                logger.error(f" | no or over two json found. Please check the upload file again. | ")  
+                return BaseResponse(status="FAILED", message=f" | no or over two json found. Please check the upload file again | ", data=False)  
+            else:  
+                json_file_name = json_files[0]  
+  
+            logger.info(f" | Total {len(wav_files)} audios found | ")  
+  
+            with zip_file.open(json_file_name) as json_file:  
+                json_data = json.load(json_file)  
+  
+            if len(json_data) != len(wav_files):  
+                logger.error(f" | We found json pair '{len(json_data)}' with audio '{len(wav_files)}' not match. Please check the upload file again. | ")  
+                return BaseResponse(status="FAILED", message=f" | We found json pair '{len(json_data)}' with audio '{len(wav_files)}' not match. Please check the upload file again | ", data=False)  
+  
+            for item in json_data:  
+                if 'audio' not in item or 'sentence' not in item:  
+                    logger.error(f" | Missing 'audio' or 'sentence' in JSON data. line: {item} | ")  
+                    return BaseResponse(status="FAILED", message=f" | Missing 'audio' or 'sentence' in JSON data. line: {item} | ", data=False)  
+                elif item['audio'] not in wav_files:
+                    logger.error(f" | Missing audio '{item['audio']}' | ")
+                    return BaseResponse(status="FAILED", message=f" | Missing audio '{item['audio']}' | ", data=False)  
+  
+            logger.info(f" | Start to save audios | ")  
+            for wav_file in wav_files:  
+                if wav_file in [item['audio'] for item in json_data]:  
+                    wav_output_path = os.path.join(SPEAKERFOLDER, wav_file)  
+                    with open(wav_output_path, 'wb') as wav_output_file:  
+                        wav_output_file.write(zip_file.read(wav_file))  
+                else: 
+                    logger.error(f" | found an audio '{wav_file}' not in json pair. Please check the upload file again. | ")
+                    return BaseResponse(status="FAILED", message=f" | found an audio '{wav_file}' not in json pair. Please check the upload file again | ", data=False)  
+                    
+            logger.info(f" | Start to save json | ")  
+            os.makedirs(CUSTOMSPEAKERPATH, exist_ok=True)  
+            json_output_path = os.path.join(CUSTOMSPEAKERPATH, task_id + ".json")  
+            with open(json_output_path, 'wb') as json_output_file:  
+                json_output_file.write(zip_file.read(json_file_name))  
+            
+            logger.info(f" | All process completed. Now task '{task_id}' can use custom speakers | ")  
+            return BaseResponse(status="OK", message=f" | All process completed. Now task '{task_id}' can use custom speakers | ", data=True)  
+
+                        
+    except zipfile.BadZipFile:  
+        logger.error(f" | Bad zip file. Please check the upload file again. | ")  
+        return BaseResponse(status="FAILED", message=f" | Bad zip file. Please check the upload file again | ", data=False)  
+    except json.JSONDecodeError:  
+        logger.error(f" | JSON decode error. Please check the upload file again. | ")  
+        return BaseResponse(status="FAILED", message=f" | JSON decode error. Please check the upload file again | ", data=False)  
+    
   
 @app.post("/check_csv_format")  
 async def csv_check(csv_file: UploadFile = File(...)):  
@@ -295,19 +367,33 @@ def delete_task(task_id: str):
         A response object indicating the success or failure of the deletion.  
     """  
     if audio_generator.task_flags.get(task_id) or model.task_flags.get(task_id):  
-        logger.info(f" | Task {task_id} is still running. try to stop the task. | ")  
+        logger.info(f" | Task {task_id} is still running. try to stop the task. | ")
         stop_task(task_id)  
       
+
+    csv_file = os.path.join(CSV_TMP, task_id + ".csv")  
+    if os.path.isfile(csv_file):  
+        logger.info(f" | removed '{csv_file}' | ")
+        os.remove(csv_file)  
+        
+    custom_speaker_json = os.path.join(CUSTOMSPEAKERPATH, task_id+".json")
+    if os.path.isfile(custom_speaker_json):
+        with open(custom_speaker_json, 'r') as speakers_file:  
+            speakers = json.load(speakers_file)
+            for speaker in speakers:
+                audio = os.path.join(SPEAKERFOLDER, speaker['audio'])   
+                if os.path.isfile(audio):
+                    os.remove(audio)  
+        logger.info(f" | removed '{custom_speaker_json}' and all custom speakers in task '{task_id}' | ")
+        os.remove(custom_speaker_json)  
+        
     output_path = os.path.join(OUTPUTPATH, task_id)  
     if not os.path.exists(output_path):  
-        logger.error(f" | Please check the task ID is correct | ")  
-        return BaseResponse(status="FAILED", message=f" | Task not found | ", data=False)  
+        logger.error(f" | Task output folder not found. Please check the task ID is correct | ")  
+        return BaseResponse(status="FAILED", message=f" | Task output folder not found. Please check the task ID is correct | ", data=False)  
     else:  
+        logger.info(f" | removed task output folder '{output_path}' | ")
         shutil.rmtree(output_path)  
-      
-    csv_file_path = os.path.join(CSV_TMP, task_id + ".csv")  
-    if os.path.exists(csv_file_path):  
-        os.remove(csv_file_path)  
       
     logger.info(f" | task ID: {task_id} has been deleted. | ")  
     return BaseResponse(status="OK", message=f" | task ID: {task_id} has been deleted. | ", data=True)  
@@ -339,7 +425,7 @@ def get_audio(task_id: str):
         logger.info(f" | '{task_id}.zip' not found. | ")  
         logger.info(f" | Start to zip audios. (It may need some times) | ")  
         start = time.time()  
-        try:  
+        try:
             zip_wav_files(output_path)  
         except Exception as e:  
             logger.error(f"Error zipping files for task {task_id}: {e}")  
@@ -347,7 +433,7 @@ def get_audio(task_id: str):
         end = time.time()  
         logger.info(f" | ZIP archive {task_id}.zip completed. zip time: {end-start} | ")  
       
-    logger.info(f" | Try to transfer '{task_id}.zip'. | ")  
+    logger.info(f" | Try to download '{task_id}.zip'. | ")  
     return FileResponse(zip_file, media_type='application/zip', filename=f"{task_id}.zip")  
   
 @app.put("/zip_audio")  
@@ -391,7 +477,7 @@ def zip_audio(task_id: str):
 ##############################################################################
 
 @app.post("/txt2csv")  
-def txt2csv(file: UploadFile = File(...), expansion_ratio: float = 1.0):  
+def txt2csv(task_id: str =  None , expansion_ratio: float = 1.0, file: UploadFile = File(...)):  
     # Load the text sample to be generated  
     logger.info(f" | Start to load text sample | ")  
       
@@ -399,14 +485,23 @@ def txt2csv(file: UploadFile = File(...), expansion_ratio: float = 1.0):
         texts = file.file.read().decode('utf-8').splitlines()  
         text_num = len(texts)  
     else:  
-        logger.info(f" | We only support txt file | ")  
+        logger.error(f" | We only support txt file | ")  
         return BaseResponse(status="FAILED", message=f" | We only support txt file | ", data=False)  
   
     # Load speakers  
     logger.info(f" | Start to load speakers | ")  
     with open(SPEAKERS, 'r') as speakers_file:  
         speakers = json.load(speakers_file)  
-        speaker_num = len(speakers)  
+    
+    if task_id:
+        custom_speaker_json = os.path.join(CUSTOMSPEAKERPATH, task_id+".json")
+        if os.path.isfile(custom_speaker_json):
+            with open(custom_speaker_json, 'r') as speakers_file:  
+                custom_speakers = json.load(speakers_file)  
+                for speaker in custom_speakers:
+                   speakers.append(speakers)
+        
+    speaker_num = len(speakers)  
   
     # Extend data  
     total_num = int(text_num * expansion_ratio)  
@@ -418,7 +513,7 @@ def txt2csv(file: UploadFile = File(...), expansion_ratio: float = 1.0):
     # Write into CSV format  
     logger.info(f" | Start to write into csv format | ")  
     try:  
-        csv_filename = os.path.join(CSV_TMP, file.filename.replace(".txt", ".csv"))  
+        csv_filename = os.path.join(CSV_TMP, f"{task_id}.csv")  
         with open(csv_filename, 'w', newline='') as csv_file:  
             writer = csv.writer(csv_file)  
             writer.writerow(CSV_HEADER_FORMAT)
@@ -431,7 +526,7 @@ def txt2csv(file: UploadFile = File(...), expansion_ratio: float = 1.0):
         return BaseResponse(status="FAILED", message=f" | Something wrong when writing csv: {e} | ", data=False)  
   
     logger.info(f" | Generate csv file successful | ")  
-    return FileResponse(csv_filename, media_type='application/csv', filename=file.filename.replace(".txt", ".csv"))  
+    return FileResponse(csv_filename, media_type='application/csv', filename=f"{task_id}.csv")  
     
   
 ##############################################################################  
