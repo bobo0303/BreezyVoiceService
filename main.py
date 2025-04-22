@@ -68,7 +68,10 @@ def HelloWorld(name: str = None):
   
 #############################################################################  
   
-  
+@app.get("/speaker_list")
+def speaker_list(task_id: str):
+    return
+
 @app.get("/task_status")  
 def audio_quantity(task_id: str):  
     """   
