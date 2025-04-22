@@ -11,60 +11,55 @@ import shutil
 import signal  
 import zipfile  
 import uvicorn  
-import threading  
+import threading
+import multiprocessing
 from threading import Thread, Event  
 from datetime import datetime  
   
-from api.batch_inference import AudioGenerate  
 from api.threading_api import process_batch_task, quality_checking_task  
-from api.whisper_api import Model  
 from api.utils import load_file_list, zip_wav_files  
 
-from lib.constant import OUTPUTPATH, CSV_TMP, CSV_HEADER_FORMAT, SPEAKERFOLDER, CUSTOMSPEAKERPATH, SPEAKERS, QUALITY_PASS_TXT, QUALITY_FAIL_TXT  
+from lib.constant import OUTPUTPATH, CSV_TMP, CSV_HEADER_FORMAT, SPEAKERFOLDER, CUSTOMSPEAKERPATH, SPEAKERS, QUALITY_PASS_TXT, QUALITY_FAIL_TXT, Common
 from lib.base_object import BaseResponse  
 from lib.log_config import setup_sys_logging  
-  
+
+
 #############################################################################  
-  
-# Ensure necessary directories exist  
-if not os.path.exists(CSV_TMP):  
-    os.makedirs(CSV_TMP)  
-if not os.path.exists(OUTPUTPATH):  
-    os.makedirs(OUTPUTPATH)  
-if not os.path.exists("./logs"):  
-    os.mkdir("./logs")  
-  
-# Setup logging  
-logger = setup_sys_logging()  
-  
-# Configure UTC+8 time  
-utc_now = datetime.now(pytz.utc)  
-tz = pytz.timezone('Asia/Taipei')  
-local_now = utc_now.astimezone(tz)  
   
 # Initialize FastAPI app and model  
 app = FastAPI()  
-model = Model()  
+task_manager = {}
   
 #############################################################################  
   
-# Log the initialization of BreezyVoice  
-logger.info(" | ########################################################### | ")  
-logger.info(f" | Start to loading BreezyVoice. | ")  
-start = time.time()  
-audio_generator = AudioGenerate()  
-end = time.time()  
-logger.info(f" | BreezyVoice has been loaded successfully in {end - start:.2f} seconds. | ")  
-logger.info(" | ########################################################### | ")  
+def initialize_logging_and_directories():  
+    # Setup system logging.  
+    logger = setup_sys_logging()  
+    
+    # Configure UTC+8 time zone.  
+    utc_now = datetime.now(pytz.utc)  
+    tz = pytz.timezone('Asia/Taipei')  
+    local_now = utc_now.astimezone(tz)  
+
+    # Ensure necessary directories exist  
+    if not os.path.exists(CSV_TMP):  
+        os.makedirs(CSV_TMP)  
+    if not os.path.exists(OUTPUTPATH):  
+        os.makedirs(OUTPUTPATH)  
+    if not os.path.exists("./logs"):  
+        os.mkdir("./logs")  
+
+    # Log any existing tasks  
+    logger.info(" | ########################################################### | ")  
+    if os.listdir(OUTPUTPATH):  
+        logger.info(f" | The history of alive task | ")  
+        for folder in os.listdir(OUTPUTPATH):  
+            logger.info(f" | task ID: {folder} | ")  
+    else:  
+        logger.info(f" | no found any previous task alive | ")  
+    logger.info(" | ########################################################### | ")  
   
-# Log any existing tasks  
-if os.listdir(OUTPUTPATH):  
-    logger.info(f" | The history of alive task | ")  
-    for folder in os.listdir(OUTPUTPATH):  
-        logger.info(f" | task ID: {folder} | ")  
-else:  
-    logger.info(f" | no found any previous task alive | ")  
-logger.info(" | ########################################################### | ")  
+    return logger, tz, local_now
   
 #############################################################################  
   
@@ -77,18 +72,35 @@ def stop_task(task_id):
     :return: BaseResponse  
         A response object indicating the success or failure of the stop operation.  
     """  
-    audio_generator.stop_task(task_id)  
-    model.stop_task(task_id)  
+    try:
+        task_manager[task_id]["generate"].send(Common.STOP.value)
+        if task_manager[task_id]["quality"]:
+            task_manager[task_id]["quality"].send(Common.STOP.value)
+    except Exception as e:  
+        logger.error(f" | An error occurred when cancel task : {e} | task ID: {task_id} | ")  
+        return BaseResponse(status="FAILED", message=f" | An error occurred when cancel task : {e} | task ID: {task_id} | ", data=False)
+    
     waiting_count = 0  
+    
     while True:  
-        if audio_generator.task_flags.get(task_id) is None and model.task_flags.get(task_id) is None:  
-            break  
-        time.sleep(5)  
-        waiting_count += 1  
-        logger.info(f" | Waiting for task {task_id} to stop... | ")  
-        if waiting_count >= 10:  # This isn't a good way to stop the task, but it works. Maybe we can improve it in the future.  
-            logger.error(f" | Try to stop Task {task_id} has already 10 times. But nothing happens. | ")  
-            return BaseResponse(status="FAILED", message=f" | Failed | Try to stop Task {task_id} has already 10 times. But nothing happens. | ", data=False)  
+        try:
+            task_manager[task_id]["generate"].send(Common.STATE.value)
+            if task_manager[task_id]["quality"]:
+                task_manager[task_id]["quality"].send(Common.STATE.value)
+            if task_manager[task_id]["generate"].recv() is None and (task_manager[task_id]["quality"].recv() if task_manager[task_id]["quality"] else None) is None:  
+                break  
+            time.sleep(5)  
+            waiting_count += 1  
+            logger.info(f" | Waiting for task {task_id} to stop... | ")  
+            if waiting_count >= 10:  # This isn't a good way to stop the task, but it works. Maybe we can improve it in the future.  
+                logger.error(f" | Try to stop Task {task_id} has already 10 times. But nothing happens. | ")  
+                return BaseResponse(status="FAILED", message=f" | Failed | Try to stop Task {task_id} has already 10 times. But nothing happens. | ", data=False)  
+        except BrokenPipeError as e:
+            break
+        except Exception as e: 
+            logger.error(f" | An error occurred when cancel task : {e} | task ID: {task_id} | ") 
+            return BaseResponse(status="FAILED", message=f" | An error occurred when cancel task : {e} | task ID: {task_id} | ", data=False)
+            
     logger.info(f" | Task {task_id} all process has been stopped. | ")  
   
 #############################################################################  
@@ -99,34 +111,34 @@ def HelloWorld(name: str = None):
   
 #############################################################################  
   
-@app.on_event("startup")  
-async def load_default_model_preheat():  
-    """   
-    The process of loading the default model and preheating on startup.  
+# @app.on_event("startup")  
+# async def load_default_model_preheat():  
+#     """   
+#     The process of loading the default model and preheating on startup.  
       
-    This function loads the default model and preheats it by running a few  
-    inference operations. This is useful to reduce the initial latency  
-    when the model is first used.  
+#     This function loads the default model and preheats it by running a few  
+#     inference operations. This is useful to reduce the initial latency  
+#     when the model is first used.  
       
-    :param None: The function does not take any parameters.  
-    :rtype: None: The function does not return any value.  
-    :logs: Loading and preheating status and times.  
-    """  
-    logger.info(f" | Start to loading whisper model. | ")  
-    # Load model  
-    default_model = "large_v2"  
-    model.load_model(default_model)  # Directly load the default model  
-    logger.info(f" | Default model {default_model} has been loaded successfully. | ")  
-    # Preheat  
-    logger.info(f" | Start to preheat model. | ")  
-    default_audio = "audio/test.wav"  
-    start = time.time()  
-    for _ in range(5):  
-        model.transcribe(default_audio, "en")  
-    end = time.time()  
-    logger.info(f" | Preheat model has been completed in {end - start:.2f} seconds. | ")  
-    logger.info(" | ########################################################### | ")  
-    delete_old_audio_files()  
+#     :param None: The function does not take any parameters.  
+#     :rtype: None: The function does not return any value.  
+#     :logs: Loading and preheating status and times.  
+#     """  
+#     logger.info(f" | Start to loading whisper model. | ")  
+#     # Load model  
+#     default_model = "large_v2"  
+#     model.load_model(default_model)  # Directly load the default model  
+#     logger.info(f" | Default model {default_model} has been loaded successfully. | ")  
+#     # Preheat  
+#     logger.info(f" | Start to preheat model. | ")  
+#     default_audio = "audio/test.wav"  
+#     start = time.time()  
+#     for _ in range(5):  
+#         model.transcribe(default_audio, "en")  
+#     end = time.time()  
+#     logger.info(f" | Preheat model has been completed in {end - start:.2f} seconds. | ")  
+#     logger.info(" | ########################################################### | ")  
+#     delete_old_audio_files()  
   
 ##############################################################################  
   
@@ -154,14 +166,25 @@ def audio_quantity(task_id: str):
     keep_num = len(load_file_list(passed_list))  
     delete_num = len(load_file_list(failed_list))  
     unprocessed_num = audio_count - keep_num  
-      
-    if audio_generator.task_flags.get(task_id) or model.task_flags.get(task_id):  
-        state = "running"  
-        logger.info(f" | Task is running. | task ID: {task_id} | ")  
-    else:  
+    
+    if task_manager.get(task_id):
+        try:
+            task_manager[task_id]["generate"].send(Common.STATE.value)
+            if task_manager[task_id]["quality"]:
+                task_manager[task_id]["quality"].send(Common.STATE.value)
+            if task_manager[task_id]["generate"].recv() or task_manager[task_id]["quality"].recv() if task_manager[task_id]["quality"] else False:  
+                state = "running"  
+                logger.info(f" | Task is running. | task ID: {task_id} | ")  
+            else:  
+                state = "stopped"  
+                logger.info(f" | Task is stopped. | task ID: {task_id} | ")  
+        except Exception as e:  
+            logger.error(f" | An error occurred when getting task state: {e} | task ID: {task_id} | ")  
+            return BaseResponse(status="FAILED", message=f" | An error occurred when getting task state: {e} | task ID: {task_id} | ", data=False)  
+    else:
         state = "stopped"  
-        logger.info(f" | Task is stopped. | task ID: {task_id} | ")  
-        
+        logger.info(f" | Task is stopped. | task ID: {task_id} | ") 
+
     csv_file_path = os.path.join(CSV_TMP, task_id + ".csv")  
     with open(csv_file_path, mode='r', encoding='utf-8') as file:  
         reader = csv.reader(file)  
@@ -320,21 +343,30 @@ async def batch_generate(
         os.makedirs(output_path)  
         logger.info(f" | Start new task | task ID: {task_id} |")  
       
-    generate_process = threading.Thread(target=process_batch_task, args=(csv_file_path, output_path, task_id, audio_generator, quality_check))  
+    # generate_process = threading.Thread(target=process_batch_task, args=(csv_file_path, output_path, task_id, quality_check, None))  
+    generate_parent_conn, generate_child_conn = multiprocessing.Pipe()
+    generate_process = multiprocessing.Process(target=process_batch_task, args=(csv_file_path, output_path, task_id, quality_check, generate_child_conn))  
     generate_process.start()  
       
     if quality_check:  
-        quality_process = threading.Thread(target=quality_checking_task, args=(task_id, model))  
+        quality_parent_conn, quality_child_conn = multiprocessing.Pipe()
+        # quality_process = threading.Thread(target=quality_checking_task, args=(task_id, model))  
+        quality_process = multiprocessing.Process(target=quality_checking_task, args=(task_id, quality_child_conn))  
         quality_process.start()  
     else:  
+        quality_parent_conn = None
+        quality_process = None
         passed_list = os.path.join(output_path, QUALITY_PASS_TXT)  
         failed_list = os.path.join(output_path, QUALITY_FAIL_TXT)  
-          
+        
         if os.path.exists(passed_list):  
             os.remove(passed_list)  
         if os.path.exists(failed_list):  
             os.remove(failed_list)  
-      
+    
+    # add task into task manager 
+    task_manager[task_id] = {"generate": generate_parent_conn, "quality": quality_parent_conn}
+    
     return BaseResponse(status="OK", message=f" | batch generation started. | task ID: {task_id} | ", data=task_id) 
 
 @app.post("/cancel_task")  
@@ -347,10 +379,21 @@ def cancel_task(task_id: str):
     :return: BaseResponse  
         A response object indicating the success or failure of the cancellation.  
     """  
-    if not audio_generator.task_flags.get(task_id) and not model.task_flags.get(task_id):  
-        logger.info(f" | task ID: {task_id} | all process has been stopped. | ")  
-        return BaseResponse(status="OK", message=f" | task ID: {task_id} | all process has been stopped. | ", data=True)  
-      
+    if task_manager.get(task_id):
+        try:
+            task_manager[task_id]["generate"].send(Common.STATE.value)
+            if task_manager[task_id]["quality"]:
+                task_manager[task_id]["quality"].send(Common.STATE.value)
+            if not task_manager[task_id]["generate"].recv() and not task_manager[task_id]["quality"].recv() if task_manager[task_id]["quality"] else False:  
+                logger.info(f" | task ID: {task_id} | all process has been stopped. | ")  
+                return BaseResponse(status="OK", message=f" | task ID: {task_id} | all process has been stopped. | ", data=True) 
+        except Exception as e:
+            logger.error(f" | An error occurred when getting task '{task_id}' state: {str(e)} | ")  
+            return BaseResponse(status="FAILED", message=f" | An error occurred when getting task '{task_id}' state: {str(e)} | ", data=False)  
+    else:
+        logger.info(f" | task '{task_id}' not found | ")  
+        return BaseResponse(status="OK", message=f" | task '{task_id}' not found | ", data=False)       
+
     logger.info(f" | Get task ID: {task_id} | ")  
     logger.info(f" | Start to cancel task | ")  
     stop_task(task_id)  
@@ -366,11 +409,18 @@ def delete_task(task_id: str):
     :return: BaseResponse  
         A response object indicating the success or failure of the deletion.  
     """  
-    if audio_generator.task_flags.get(task_id) or model.task_flags.get(task_id):  
-        logger.info(f" | Task {task_id} is still running. try to stop the task. | ")
-        stop_task(task_id)  
-      
-
+    if task_manager.get(task_id):
+        try:
+            task_manager[task_id]["generate"].send(Common.STATE.value)
+            if task_manager[task_id]["quality"]:
+                task_manager[task_id]["quality"].send(Common.STATE.value)
+            if task_manager[task_id]["generate"].recv() or task_manager[task_id]["quality"].recv() if task_manager[task_id]["quality"] else False:  
+                logger.info(f" | Task {task_id} is still running. try to stop the task. | ")
+                stop_task(task_id)   
+        except Exception as e:
+            logger.error(f" | An error occurred when getting task '{task_id}' state: {str(e)} | ")  
+            return BaseResponse(status="FAILED", message=f" | An error occurred when getting task '{task_id}' state: {str(e)} | ", data=False)
+        
     csv_file = os.path.join(CSV_TMP, task_id + ".csv")  
     if os.path.isfile(csv_file):  
         logger.info(f" | removed '{csv_file}' | ")
@@ -415,9 +465,17 @@ def get_audio(task_id: str):
         logger.error(f" | Please check the task ID is correct | ")  
         return BaseResponse(status="FAILED", message=f" | Please check the task ID is correct | ", data=False)  
       
-    if audio_generator.task_flags.get(task_id) or model.task_flags.get(task_id):  
-        logger.error(f" | task '{task_id} is still running. please stop it first | ")  
-        return BaseResponse(status="FAILED", message=f" | task '{task_id} is still running. please stop it first | ", data=False)  
+    if task_manager.get(task_id):
+        try:
+            task_manager[task_id]["generate"].send(Common.STATE.value)
+            if task_manager[task_id]["quality"]:
+                task_manager[task_id]["quality"].send(Common.STATE.value)
+            if task_manager[task_id]["generate"].recv() or task_manager[task_id]["quality"].recv() if task_manager[task_id]["quality"] else False:  
+                logger.error(f" | task '{task_id} is still running. please stop it first | ")  
+                return BaseResponse(status="FAILED", message=f" | task '{task_id} is still running. please stop it first | ", data=False)  
+        except Exception as e:
+            logger.error(f" | An error occurred when getting task '{task_id}' state: {str(e)} | ")  
+            return BaseResponse(status="FAILED", message=f" | An error occurred when getting task '{task_id}' state: {str(e)} | ", data=False)  
       
     if os.path.isfile(zip_file):  
         logger.info(f" | zip file found. | ")  
@@ -452,10 +510,18 @@ def zip_audio(task_id: str):
     if not os.path.exists(output_path):  
         logger.error(f" | Please check the task ID is correct | ")  
         return BaseResponse(status="FAILED", message=f" | Please check the task ID is correct | ", data=False)  
-      
-    if audio_generator.task_flags.get(task_id) or model.task_flags.get(task_id):  
-        logger.error(f" | task '{task_id} is still running. please stop it first | ")  
-        return BaseResponse(status="FAILED", message=f" | task '{task_id} is still running. please stop it first | ", data=False)  
+    
+    if task_manager.get(task_id):
+        try:
+            task_manager[task_id]["generate"].send(Common.STATE.value)
+            if task_manager[task_id]["quality"]:
+                task_manager[task_id]["quality"].send(Common.STATE.value)
+            if task_manager[task_id]["generate"].recv() or task_manager[task_id]["quality"].recv() if task_manager[task_id]["quality"] else False:  
+                logger.error(f" | task '{task_id} is still running. please stop it first | ")  
+                return BaseResponse(status="FAILED", message=f" | task '{task_id} is still running. please stop it first | ", data=False)  
+        except Exception as e:
+            logger.error(f" | An error occurred when getting task '{task_id}' state: {str(e)} | ")  
+            return BaseResponse(status="FAILED", message=f" | An error occurred when getting task '{task_id}' state: {str(e)} | ", data=False)
       
     if os.path.isfile(zip_file):  
         logger.info(f" | '{task_id}.zip' already excited. | ")  
@@ -554,7 +620,7 @@ def delete_old_audio_files():
                 logger.info(f"Deleted old file: {file_path}")  
   
 # Daily task scheduling  
-def schedule_daily_task(stop_event):  
+def schedule_daily_task(stop_event, local_now):  
     """   
     Schedule a daily cleanup task that removes outdated audio files at midnight.  
       
@@ -567,10 +633,7 @@ def schedule_daily_task(stop_event):
             time.sleep(60)  # Prevent triggering multiple times within the same minute  
         time.sleep(1)  
   
-# Start daily task scheduling  
-stop_event = Event()  
-task_thread = Thread(target=schedule_daily_task, args=(stop_event,))  
-task_thread.start()  
+
   
 # Signal handler for graceful shutdown  
 def handle_exit(sig, frame):  
@@ -581,9 +644,7 @@ def handle_exit(sig, frame):
     task_thread.join()  
     logger.info("Scheduled task has been stopped.")  
     os._exit(0)  
-  
-signal.signal(signal.SIGINT, handle_exit)  
-signal.signal(signal.SIGTERM, handle_exit)  
+
   
 @app.on_event("shutdown")  
 def shutdown_event():  
@@ -596,8 +657,18 @@ def shutdown_event():
     logger.info("Scheduled task has been stopped.")  
   
 if __name__ == "__main__":  
+    multiprocessing.set_start_method('spawn') 
+    logger, tz, local_now = initialize_logging_and_directories()
+    
+    # Start daily task scheduling  
+    stop_event = Event()  
+    task_thread = Thread(target=schedule_daily_task, args=(stop_event, local_now))  
+    task_thread.start()  
+    signal.signal(signal.SIGINT, handle_exit)  
+    signal.signal(signal.SIGTERM, handle_exit)  
+    
     port = int(os.environ.get("PORT", 80))  
     uvicorn.run(app, log_level='info', host='0.0.0.0', port=port)  
     
     
-    
+     

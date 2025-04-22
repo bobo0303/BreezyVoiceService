@@ -1,11 +1,14 @@
 import os  
 from lib.constant import SPEAKERFOLDER  
 from lib.log_config import setup_sys_logging  
+
+from api.batch_inference import AudioGenerate
+from api.whisper_api import Model
   
 # Setup logging  
 logger = setup_sys_logging()  
   
-def process_batch_task(csv_file: str, output_path: str, task_id: str, audio_generator, quality_check: bool) -> None:  
+def process_batch_task(csv_file: str, output_path: str, task_id: str, quality_check: bool, child) -> None:  
     """  
     Process a batch of audio generation tasks.  
       
@@ -19,9 +22,10 @@ def process_batch_task(csv_file: str, output_path: str, task_id: str, audio_gene
         An instance of the AudioGenerate class.  
     :param quality_check: bool  
         Flag indicating whether to perform quality checking.  
-    :rtype: None  
+    :rtype: None                                                                                                                                                                                                        
     :logs: Batch processing status and errors.  
-    """  
+    """       
+    audio_generator = AudioGenerate(child=child)
     try:  
         audio_generator.process_batch(  
             csv_file=csv_file,  
@@ -33,7 +37,7 @@ def process_batch_task(csv_file: str, output_path: str, task_id: str, audio_gene
     except Exception as e:  
         logger.error(f"| task ID {task_id} | Error processing batch task: {e} | ")  
   
-def quality_checking_task(task_id: str, model) -> None:  
+def quality_checking_task(task_id: str, child) -> None:  
     """  
     Perform quality check on the audio files of a specific task.  
       
@@ -44,6 +48,7 @@ def quality_checking_task(task_id: str, model) -> None:
     :rtype: None  
     :logs: Quality check status and errors.  
     """  
+    model = Model(child=child)
     try:  
         model.quality_check(task_id)  
     except Exception as e:  

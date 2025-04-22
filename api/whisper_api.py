@@ -4,8 +4,9 @@ import time
 import torch  
 import whisper  
 from opencc import OpenCC  
+from typing import Optional  
   
-from lib.constant import ModlePath, OPTIONS, QUALITY_PASS_TXT, QUALITY_FAIL_TXT, QUALITY_THRESHOLD, CSV_TMP, OUTPUTPATH  
+from lib.constant import ModelPath, Common, OPTIONS, QUALITY_PASS_TXT, QUALITY_FAIL_TXT, QUALITY_THRESHOLD, CSV_TMP, OUTPUTPATH  
 from lib.log_config import setup_sys_logging, setup_whisper_logging  
 from api.utils import calculate_cer, load_csv_data, load_file_list, save_file_list  
   
@@ -16,14 +17,15 @@ whisper_logger = setup_whisper_logging()
 logger = setup_sys_logging()  
   
 class Model:  
-    def __init__(self):  
+    def __init__(self, child):  
         """  
         Initialize the Model class with default attributes.  
         """  
         self.model: whisper.Whisper = None  
         self.model_version: str = None  
-        self.models_path: ModlePath = ModlePath()  
-        self.task_flags: dict[str, bool] = {}  
+        self.models_path: ModelPath = ModelPath()  
+        self.task_flag: Optional[bool] = None  
+        self.child = child
   
     def load_model(self, models_name: str) -> None:  
         """  
@@ -169,30 +171,30 @@ class Model:
         keep_files = load_file_list(passed_list)  
         delete_files = load_file_list(failed_list)  
           
-        self.task_flags[task_id] = True  
+        self.task_flag = True  
           
         while True:  
-            if self.task_flags.get(task_id, False):  
+            if self.task_flag:  
                 audio_files = [f for f in os.listdir(output_path) if f.endswith('.wav')]  
                   
                 if len(keep_files) == total_audio_num:  
                     whisper_logger.info(f" | Task {task_id}: audio checking has been completed. | ")  
-                    self.task_flags[task_id] = None  
+                    self.task_flag = None  
                     break  
             else:  
                 whisper_logger.info(f" | Task {task_id}: audio checking has been stopped. | ")  
-                self.task_flags[task_id] = None  
+                self.task_flag = None  
                 break  
               
             for audio in audio_files:  
-                if self.task_flags.get(task_id, False):  
+                if self.task_flag:  
                     if audio in keep_files:  
                         continue  
                     self._process_audio_file(audio, output_path, data, keep_files, delete_files, passed_list, failed_list)  
                 else:  
                     break  
   
-    def stop_task(self, task_id: str) -> None:  
+    def stop_task(self) -> None:  
         """  
         Stop a running task.  
           
@@ -200,7 +202,12 @@ class Model:
             The ID of the task to stop.  
         :rtype: None  
         """  
-        if self.task_flags.get(task_id, None):  
-            self.task_flags[task_id] = False  
+        self.task_flag = False  
+    
+    def pc_conn(self, message):
+        if message == Common.STOP.value:
+            self.stop_task()
+        elif message == Common.STATE.value:
+            self.child.send(self.task_flag)
             
             

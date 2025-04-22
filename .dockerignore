@@ -5,7 +5,6 @@ test.py
 .git  
 *.tmp  
 *.log  
-deb
-common_voice_speakers
+common_voice_speakers/*
 tmp/*
 

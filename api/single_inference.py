@@ -297,7 +297,10 @@ def transcribe_audio(audio_file):
     return traditional_text
 
 def get_bopomofo_rare(text, converter):
+    start = time.time()
     res = converter(text)
+    end = time.time()
+    print("converter: ", end-start)
     text_w_bopomofo = [x for x in zip(list(text), res[0])]
     reconstructed_text = ""
     
@@ -369,7 +372,6 @@ def single_inference(speaker_prompt_audio_path, content_to_synthesize, output_pa
         speaker_prompt_text_transcription = transcribe_audio(speaker_prompt_audio_path)
     
     
-    
     ###normalization
     speaker_prompt_text_transcription = cosyvoice.frontend.text_normalize_new(
         speaker_prompt_text_transcription, 
@@ -379,12 +381,12 @@ def single_inference(speaker_prompt_audio_path, content_to_synthesize, output_pa
         content_to_synthesize, 
         split=False
     )
+    
     speaker_prompt_text_transcription_bopomo = get_bopomofo_rare(speaker_prompt_text_transcription, bopomofo_converter)
     generate_logger.info(f"Speaker prompt audio transcription: {speaker_prompt_text_transcription_bopomo}")
-    
-    #generate_logger.info("Content to be synthesized before bopomofo:",content_to_synthesize)
     content_to_synthesize_bopomo = get_bopomofo_rare(content_to_synthesize, bopomofo_converter)
     generate_logger.info(f"Content to be synthesized: {content_to_synthesize_bopomo}")
+    
     start = time.time()
     output = cosyvoice.inference_zero_shot_no_normalize(content_to_synthesize_bopomo, speaker_prompt_text_transcription_bopomo, prompt_speech_16k)
     end = time.time()

@@ -1,5 +1,6 @@
 
 from pydantic import BaseModel
+from enum import Enum
 import torch
 
 SPEAKERFOLDER = "common_voice_speakers"
@@ -11,7 +12,7 @@ CSV_HEADER_FORMAT =  ['speaker_prompt_audio_filename', 'speaker', 'speaker_promp
 
 #############################################################################
 
-class ModlePath(BaseModel):
+class ModelPath(BaseModel):
     large_v2: str = "models/large-v2.pt"
     medium: str = "models/medium.pt"
     breezyvoice: str = "MediaTek-Research/BreezyVoice-300M"  # first run will auto download model from huggingface
@@ -37,5 +38,12 @@ QUALITY_THRESHOLD = 0.3
 QUALITY_PASS_TXT = "keep.txt"
 QUALITY_FAIL_TXT = "del.txt"
 
+#############################################################################
+
+class Common(Enum):
+    START: str = "start"
+    STOP: str = "stop"
+    STATE: str = "state"
+    
 #############################################################################
 

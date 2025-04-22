@@ -16,6 +16,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 COPY deb/cudnn-local-repo-ubuntu2204-9.1.0_1.0-1_amd64.deb /tmp/  
 COPY requirements.txt /tmp/requirements.txt
+COPY whl/g2pw-0.1.1-py3-none-any.whl whl/g2pw-0.1.1-py3-none-any.whl
 
 RUN pip3 install -r /tmp/requirements.txt  
   
@@ -35,6 +36,7 @@ ENV PYTHONUTF8=1
 
 RUN rm /tmp/cudnn-local-repo-ubuntu2204-9.1.0_1.0-1_amd64.deb
 RUN rm /tmp/requirements.txt
+RUN rm whl/g2pw-0.1.1-py3-none-any.whl
 
 # docker run -d -it --gpus all --shm-size 32G --runtime nvidia --device=/dev/nvidia-uvm --device=/dev/nvidia-uvm-tools --device=/dev/nvidiactl --device=/dev/nvidia0 --name bv_service -p 52010:80 -v /userdata/bobo/BreezyVoice:/mnt2 -v /userdata/bobo/BreezyVoice_service:/mnt -v /userdata/bobo/BreezyVoice_service/tmp:/tmp bv_service:lastest bash  
 
