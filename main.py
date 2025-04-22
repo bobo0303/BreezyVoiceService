@@ -18,7 +18,7 @@ from datetime import datetime
 from api.threading_api import process_batch_task, quality_checking_task  
 from api.utils import load_file_list, zip_wav_files, state_check, stop_task, split_csv
 
-from lib.constant import OUTPUTPATH, CSV_TMP, CSV_HEADER_FORMAT, SPEAKERFOLDER, CUSTOMSPEAKERPATH, SPEAKERS, QUALITY_PASS_TXT, QUALITY_FAIL_TXT, Common
+from lib.constant import OUTPUTPATH, CSV_TMP, CSV_HEADER_FORMAT, SPEAKERFOLDER, CUSTOMSPEAKERPATH, SPEAKERS, QUALITY_PASS_TXT, QUALITY_FAIL_TXT
 from lib.base_object import BaseResponse  
 from lib.log_config import setup_sys_logging  
 
@@ -251,7 +251,7 @@ async def batch_generate(
     csv_file: UploadFile = File(...),  
     task_id: str = Form(...),  
     quality_check: bool = Form(...),  
-    num_thread: int = 1,  
+    num_thread: int = 3,  
 ):  
     """   
     Start batch audio generation based on a CSV file.  
