@@ -28,6 +28,8 @@ class AudioGenerate:
         self.task_flag: Optional[bool] = None  
         self.child = child
         self.stop_event = threading.Event()  
+        self.monitor_thread = threading.Thread(target=self.monitor_pipe)  
+        self.monitor_thread.start() 
         
     def monitor_pipe(self):  
         while not self.stop_event.is_set():  
@@ -55,8 +57,6 @@ class AudioGenerate:
         :logs: Batch processing status and progress.  
         """          
         self.task_flag = True  
-        monitor_thread = threading.Thread(target=self.monitor_pipe)  
-        monitor_thread.start() 
         
         data = pd.read_csv(csv_file)  
         total_audio_num = len(data)  
@@ -65,10 +65,11 @@ class AudioGenerate:
         dataset = Dataset.from_pandas(data)  
         dataset = dataset.shuffle(seed=int(time.time() * 1000))  
         
-        # generate_logger.info(f" | Start to load  | ")
+        csv_name = os.path.basename(csv_file)
+        generate_logger.info(f" | Start to load audio generate sub process: '{csv_name[:-4]}' | ")
         customcosyvoice = CustomCosyVoice(self.models_path.breezyvoice)  
         bopomofo_converter = G2PWConverter(num_workers=1)  
-        # generate_logger.info(f" |  | ")
+        generate_logger.info(f" | audio generate sub process: '{csv_name[:-4]}' loaded | ")
         
         def gen_audio(row):  
             if self.task_flag:  
@@ -112,10 +113,10 @@ class AudioGenerate:
             self.task_flag = None  
         else:  
             self.task_flag = None  
-            generate_logger.info(f" | Task {task_id}: audio generation has been stopped. | ")  
+            generate_logger.info(f" | Task {task_id}: audio generation '{csv_name[:-4]}' has been stopped. | ")  
         
         self.stop_event.set()  
-        monitor_thread.join()
+        self.monitor_thread.join()
         
     def stop_task(self) -> None:  
         """  

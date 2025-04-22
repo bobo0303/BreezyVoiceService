@@ -1,12 +1,14 @@
 import os  
-from lib.constant import SPEAKERFOLDER  
-from lib.log_config import setup_sys_logging  
+import time
+from lib.constant import SPEAKERFOLDER
+from lib.log_config import setup_sys_logging, setup_whisper_logging
 
 from api.batch_inference import AudioGenerate
 from api.whisper_api import Model
   
 # Setup logging  
 logger = setup_sys_logging()  
+whisper_logger = setup_whisper_logging()  
   
 def process_batch_task(csv_file: str, output_path: str, task_id: str, quality_check: bool, child) -> None:  
     """  
@@ -49,6 +51,23 @@ def quality_checking_task(task_id: str, child) -> None:
     :logs: Quality check status and errors.  
     """  
     model = Model(child=child)
+
+    # Directly load the default model  
+    whisper_logger.info(" | ########################################################### | ")  
+    default_model = "large_v2"  
+    model.load_model(default_model)  
+    whisper_logger.info(f" | Default model {default_model} has been loaded successfully. | ")  
+    
+    # Preheat  
+    whisper_logger.info(f" | Start to preheat model. | ")  
+    default_audio = "audio/test.wav"  
+    start = time.time()  
+    for _ in range(5):  
+        model.transcribe(default_audio, "en")  
+    end = time.time()  
+    whisper_logger.info(f" | Preheat model has been completed in {end - start:.2f} seconds. | ")  
+    whisper_logger.info(" | ########################################################### | ")  
+    
     try:  
         model.quality_check(task_id)  
     except Exception as e:  

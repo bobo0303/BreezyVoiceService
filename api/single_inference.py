@@ -297,10 +297,7 @@ def transcribe_audio(audio_file):
     return traditional_text
 
 def get_bopomofo_rare(text, converter):
-    start = time.time()
     res = converter(text)
-    end = time.time()
-    print("converter: ", end-start)
     text_w_bopomofo = [x for x in zip(list(text), res[0])]
     reconstructed_text = ""
     

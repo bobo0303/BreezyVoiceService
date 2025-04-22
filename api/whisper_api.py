@@ -3,6 +3,7 @@ import gc
 import time  
 import torch  
 import whisper  
+import threading
 from opencc import OpenCC  
 from typing import Optional  
   
@@ -26,6 +27,9 @@ class Model:
         self.models_path: ModelPath = ModelPath()  
         self.task_flag: Optional[bool] = None  
         self.child = child
+        self.stop_event = threading.Event()  
+        self.monitor_thread = threading.Thread(target=self.monitor_pipe)  
+        self.monitor_thread.start()   
   
     def load_model(self, models_name: str) -> None:  
         """  
@@ -37,6 +41,7 @@ class Model:
         :logs: Loading status and time.  
         """  
         start = time.time()  
+        logger.info(f" | Start to loading whisper model. | ")  
         try:  
             # Release old model resources  
             self._release_model()  
@@ -51,10 +56,10 @@ class Model:
             device = "cuda" if torch.cuda.is_available() else "cpu"  
             self.model.to(device)  
             end = time.time()  
-            logger.info(f" | Model '{models_name}' loaded in {end - start:.2f} seconds. | ")  
+            whisper_logger.info(f" | Model '{models_name}' loaded in {end - start:.2f} seconds. | ")  
         except Exception as e:  
             self.model_version = None  
-            logger.error(f' | load_model() models_name:{models_name} error:{e} | ')  
+            whisper_logger.error(f' | load_model() models_name:{models_name} error:{e} | ')  
   
     def _release_model(self) -> None:  
         """  
@@ -150,6 +155,14 @@ class Model:
           
         save_file_list(passed_list, keep_files)  
         save_file_list(failed_list, delete_files)  
+        
+    def monitor_pipe(self):  
+        while not self.stop_event.is_set():  
+            if self.child.poll(): 
+                message = self.child.recv()
+                self.pc_conn(message)
+            else:  
+                time.sleep(0.1)
   
     def quality_check(self, task_id: str) -> None:  
         """  
@@ -160,6 +173,9 @@ class Model:
         :rtype: None  
         :logs: Quality check progress and results.  
         """  
+        self.task_flag = True  
+
+        
         output_path = os.path.join(OUTPUTPATH, task_id)  
         passed_list = os.path.join(output_path, QUALITY_PASS_TXT)  
         failed_list = os.path.join(output_path, QUALITY_FAIL_TXT)  
@@ -171,9 +187,7 @@ class Model:
         keep_files = load_file_list(passed_list)  
         delete_files = load_file_list(failed_list)  
           
-        self.task_flag = True  
-          
-        while True:  
+        while self.task_flag:  
             if self.task_flag:  
                 audio_files = [f for f in os.listdir(output_path) if f.endswith('.wav')]  
                   
@@ -181,10 +195,6 @@ class Model:
                     whisper_logger.info(f" | Task {task_id}: audio checking has been completed. | ")  
                     self.task_flag = None  
                     break  
-            else:  
-                whisper_logger.info(f" | Task {task_id}: audio checking has been stopped. | ")  
-                self.task_flag = None  
-                break  
               
             for audio in audio_files:  
                 if self.task_flag:  
@@ -192,7 +202,12 @@ class Model:
                         continue  
                     self._process_audio_file(audio, output_path, data, keep_files, delete_files, passed_list, failed_list)  
                 else:  
+                    whisper_logger.info(f" | Task {task_id}: audio checking has been stopped. | ")  
+                    self.task_flag = None  
                     break  
+                
+        self.stop_event.set()  
+        self.monitor_thread.join()
   
     def stop_task(self) -> None:  
         """  
