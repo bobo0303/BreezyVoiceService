@@ -4,6 +4,7 @@ from lib.constant import SPEAKERFOLDER
 from lib.log_config import setup_sys_logging, setup_whisper_logging
 
 from api.batch_inference import AudioGenerate
+from api.single_generate_service import SingleAudioGenerate
 from api.whisper_api import Model
   
 # Setup logging  
@@ -73,4 +74,12 @@ def quality_checking_task(task_id: str, child) -> None:
     except Exception as e:  
         logger.error(f"| task ID {task_id} | Error during quality checking: {e} | ")  
         
+        
+def process_single_task(task_id: str, child, queue):
+    audio_generator = SingleAudioGenerate(child=child, queue=queue)
+    try:  
+        audio_generator.gen_audio()
+    except Exception as e:  
+        logger.error(f"| task ID {task_id} | Error processing batch task: {e} | ")  
+
         

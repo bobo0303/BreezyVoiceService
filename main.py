@@ -12,11 +12,12 @@ import signal
 import zipfile  
 import uvicorn  
 import multiprocessing
+from multiprocessing import Process, Queue  
 from threading import Thread, Event  
 from datetime import datetime  
   
-from api.threading_api import process_batch_task, quality_checking_task  
-from api.utils import load_file_list, zip_wav_files, state_check, stop_task, split_csv
+from api.threading_api import process_batch_task, quality_checking_task
+from api.utils import load_file_list, zip_wav_files, state_check, stop_task, split_csv, start_service
 
 from lib.constant import OUTPUTPATH, CSV_TMP, CSV_HEADER_FORMAT, SPEAKERFOLDER, CUSTOMSPEAKERPATH, SPEAKERS, QUALITY_PASS_TXT, QUALITY_FAIL_TXT
 from lib.base_object import BaseResponse  
@@ -25,9 +26,15 @@ from lib.log_config import setup_sys_logging
 
 #############################################################################  
   
-# Initialize FastAPI app and model  
+# Initialize FastAPI app and global variable
 app = FastAPI()  
 task_manager = {}
+single_generate_state = {
+    "conn": None,
+    "queue": None,
+    "usage_list": [],
+    "readied_audio": [],
+}
   
 #############################################################################  
   
@@ -59,18 +66,15 @@ def initialize_logging_and_directories():
     logger.info(" | ########################################################### | ")  
   
     return logger, tz, local_now
-  
+
+
 #############################################################################  
   
 @app.get("/")  
 def HelloWorld(name: str = None):  
     return {"Hello": f"World {name}"}  
   
-#############################################################################  
-  
-@app.get("/speaker_list")
-def speaker_list(task_id: str):
-    return
+#############################################################################   
 
 @app.get("/task_status")  
 def audio_quantity(task_id: str):  
@@ -298,14 +302,14 @@ async def batch_generate(
     generate_parent_conns = []
     for horcrux in csv_horcruxes:
         generate_parent_conn, generate_child_conn = multiprocessing.Pipe()
-        generate_process = multiprocessing.Process(target=process_batch_task, args=(horcrux, output_path, task_id, quality_check, generate_child_conn))  
+        generate_process = Process(target=process_batch_task, args=(horcrux, output_path, task_id, quality_check, generate_child_conn))  
         generate_process.start()  
         generate_parent_conns.append(generate_parent_conn)
     
     quality_parent_conns = []
     if quality_check:  
         quality_parent_conn, quality_child_conn = multiprocessing.Pipe()
-        quality_process = multiprocessing.Process(target=quality_checking_task, args=(task_id, quality_child_conn))  
+        quality_process = Process(target=quality_checking_task, args=(task_id, quality_child_conn))  
         quality_process.start()  
     else:  
         quality_parent_conn = None
@@ -522,7 +526,7 @@ def txt2csv(task_id: str =  None , expansion_ratio: float = 1.0, file: UploadFil
             with open(custom_speaker_json, 'r') as speakers_file:  
                 custom_speakers = json.load(speakers_file)  
                 for speaker in custom_speakers:
-                   speakers.append(speakers)
+                   speakers.append(speaker)
         
     speaker_num = len(speakers)  
   
@@ -552,6 +556,123 @@ def txt2csv(task_id: str =  None , expansion_ratio: float = 1.0, file: UploadFil
     return FileResponse(csv_filename, media_type='application/csv', filename=f"{task_id}.csv")  
     
   
+##############################################################################  
+
+@app.get("/speaker_list")
+def speaker_list(task_id: str):
+    speaker_list = []
+    # Load speakers  
+    logger.info(f" | Start to load speakers | ")  
+    with open(SPEAKERS, 'r') as speakers_file:  
+        speakers = json.load(speakers_file)  
+    
+    if task_id:
+        custom_speaker_json = os.path.join(CUSTOMSPEAKERPATH, task_id+".json")
+        if os.path.isfile(custom_speaker_json):
+            logger.info(f" | Found custom apeakers. Start to load custom speakers | ")  
+            with open(custom_speaker_json, 'r') as speakers_file:  
+                custom_speakers = json.load(speakers_file)  
+                for speaker in custom_speakers:
+                   speakers.append(speaker)
+        
+    for speaker in speakers:
+        speaker_list.append(speaker['audio'])
+    speaker_num = len(speaker_list)
+    
+    logger.info(f" | Total '{speaker_num}' speakers found | ")
+    return BaseResponse(status="OK", message=f" | Total '{speaker_num}' speakers found | ", data=speaker_list) 
+
+@app.post("/start_single_generate_service")
+def start_single_generate_service(task_id: str):
+    if task_id not in single_generate_state["usage_list"]:
+        single_generate_state["usage_list"].append(task_id)
+
+    try:
+        single_generate_state = start_service(task_id, single_generate_state)
+        if isinstance(single_generate_state, BaseResponse):  
+            return single_generate_state  
+    except Exception as e:  
+        logger.error(f" | An error occurred when start service : {e} | task ID: {task_id} | ")  
+        return BaseResponse(status="FAILED", message=f" | An error occurred when start service : {e} | task ID: {task_id} | ", data=False)
+        
+    logger.info(f" | single generate service already started and task added to usage list | ")
+    return BaseResponse(status="OK", message=f" | single generate service already started and add task added to usage list | ", data=True) 
+            
+@app.post("/single_generate")
+async def single_generate(  
+    task_id: str = Form(...),  
+    speaker_name: str = Form(...),  
+    text: str = Form(...),  
+):  
+    # check service is ready if not start it
+    try:
+        single_generate_state = start_service(task_id, single_generate_state)
+        if isinstance(single_generate_state, BaseResponse):  
+            return single_generate_state  
+    except Exception as e:  
+        logger.error(f" | An error occurred when start service : {e} | task ID: {task_id} | ")  
+        return BaseResponse(status="FAILED", message=f" | An error occurred when start service : {e} | task ID: {task_id} | ", data=False)
+    
+    # get speaker text from json  
+    try:  
+        with open(SPEAKERS, 'r') as speakers_file:  
+            speakers = json.load(speakers_file)  
+    except Exception as e:  
+        logger.error(f" | Error reading speakers file: {e} | ")  
+        return BaseResponse(status="FAILED", message=f" | Error reading speakers file: {e} | ", data=False)  
+        
+    if task_id:
+        custom_speaker_json = os.path.join(CUSTOMSPEAKERPATH, task_id+".json")
+        if os.path.isfile(custom_speaker_json):
+            logger.info(f" | Found custom speakers. Start to load custom speakers | ")  
+            with open(custom_speaker_json, 'r') as speakers_file:  
+                custom_speakers = json.load(speakers_file)  
+                for speaker in custom_speakers:
+                   speakers.append(speaker)
+    
+    speaker_text = next((speaker['sentence'] for speaker in speakers if speaker_name == speaker['audio']), "")  
+    if speaker_text == "":
+        logger.error(f" | Can't find speaker text with provided speaker '{speaker_name}' | ")  
+        return BaseResponse(status="FAILED", message=f" | Can't find speaker text with provided speaker '{speaker_name}' | ", data=False) 
+    
+    # name output file
+    now = datetime.now()  
+    current_time = now.strftime("%Y-%m-%d_%H-%M-%S")  
+    output_name = f"{task_id}_{speaker_name}_{current_time}"
+    
+    info = {
+        "task_id": task_id,
+        "speaker": speaker_name,
+        "speaker_text": speaker_text,
+        "text": text,
+        "output_name": output_name,
+    }
+    
+    if single_generate_state["queue"] is not None:
+        single_generate_state["queue"].put(info)
+    else:
+        logger.error(f" | something got wrong: single generate service not found | ")
+        return BaseResponse(status="FAILED", message=f" | something got wrong: single generate service not found | ", data=False) 
+    
+    # get return audio
+    for _ in range(5):
+        time.sleep(5)
+        if single_generate_state["conn"].poll(): 
+            single_generate_state["readied_audio"].append(single_generate_state["conn"].recv())
+        # self.task_flags: dict[str, bool] = {}  
+        for ready_file in single_generate_state["readied_audio"]:
+            if ready_file.get(task_id):
+                audio = ready_file.get(task_id)
+                logger.info(f" | Get audio {os.path.basename(audio)} from single inference. | ")
+                return FileResponse(audio, media_type='audio/wav', filename=f"{output_name}.wav")  
+
+    logger.info(f" | task '{task_id}: ' time out | ")
+    return BaseResponse(status="FAILED", message=f" | task '{task_id}: ' time out | ", data=False) 
+
+@app.post("/stop_single_generate_service")
+def stop_single_generate_service():
+    return
+
 ##############################################################################  
   
 # Clean up audio files  
@@ -589,9 +710,7 @@ def schedule_daily_task(stop_event, local_now):
             delete_old_audio_files()  
             time.sleep(60)  # Prevent triggering multiple times within the same minute  
         time.sleep(1)  
-  
-
-  
+    
 # Signal handler for graceful shutdown  
 def handle_exit(sig, frame):  
     """   
