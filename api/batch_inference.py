@@ -60,6 +60,8 @@ class AudioGenerate:
         
         data = pd.read_csv(csv_file)  
         total_audio_num = len(data)  
+        audio_name = data['output_audio_filename'].apply(lambda x: x if str(x).endswith('.wav') else str(x) + '.wav')  
+        audio_set = set(audio_name.tolist())
         
         # Transform pandas DataFrame to HuggingFace Dataset  
         dataset = Dataset.from_pandas(data)  
@@ -68,7 +70,7 @@ class AudioGenerate:
         csv_name = os.path.basename(csv_file)
         generate_logger.info(f" | Start to load audio generate sub process: '{csv_name[:-4]}' | ")
         customcosyvoice = CustomCosyVoice(self.models_path.breezyvoice)  
-        bopomofo_converter = G2PWConverter(num_workers=1)  
+        bopomofo_converter = G2PWConverter()  
         generate_logger.info(f" | audio generate sub process: '{csv_name[:-4]}' loaded | ")
         
         def gen_audio(row):  
@@ -83,40 +85,45 @@ class AudioGenerate:
                     return row  # {"status": "failed", "reason": "file not found"}  
                 if not os.path.exists(output_audio_path):  
                     single_inference(speaker_prompt_audio_path, content_to_synthesize, output_audio_path, customcosyvoice, bopomofo_converter, speaker_prompt_text_transcription)  
-  
-        while self.task_flag:
-            # Traverse the entire data to generate audio files
-            dataset = dataset.map(gen_audio, num_proc=1)  # num_proc can't set over than 1  
-            
-            if quality_check:  
-                passed_list = os.path.join(output_path, QUALITY_PASS_TXT)  
-                keep_files = load_file_list(passed_list)  
-                if len(keep_files) == total_audio_num:  
-                    break  
-                time.sleep(1)  
-            else:  
-                audio_files = [f for f in os.listdir(output_path) if f.endswith('.wav')]  
-                if len(audio_files) == total_audio_num:  
-                    break  
+        try:
+            while self.task_flag:
+                # Traverse the entire data to generate audio files
+                dataset = dataset.map(gen_audio, num_proc=1)  # num_proc can't set over than 1  
+                
+                if quality_check:  
+                    passed_list = os.path.join(output_path, QUALITY_PASS_TXT)  
+                    keep_files = load_file_list(passed_list)  
+                    keep_files = keep_files.intersection(audio_set)  
+
+                    if len(keep_files) == total_audio_num:  
+                        break  
+                    time.sleep(1)  
                 else:  
-                    if self.task_flag:
-                        generate_logger.error(f" | Task {task_id} haven't generate all audios. | Next round will be started. | (something get wrong) ")
-                    break
-  
-        if self.task_flag:  
-            generate_logger.info(f" | Task {task_id}: audio generation has been completed. | ")  
-            generate_logger.info(f" | Start to ZIP all generated wav files. | ")  
-            start = time.time()  
-            zip_wav_files(output_path)  
-            end = time.time()  
-            generate_logger.info(f" | ZIP archive {task_id}.zip completed. zip time: {end-start}| ")  
-            self.task_flag = None  
-        else:  
-            self.task_flag = None  
-            generate_logger.info(f" | Task {task_id}: audio generation '{csv_name[:-4]}' has been stopped. | ")  
-        
-        self.stop_event.set()  
-        self.monitor_thread.join()
+                    audio_files = [f for f in os.listdir(output_path) if f.endswith('.wav')]  
+                    audio_files  = set(audio_files)
+                    audio_files = audio_files.intersection(audio_set)  
+                    
+                    if len(audio_files) == total_audio_num:  
+                        break  
+                    else:  
+                        if self.task_flag:
+                            generate_logger.error(f" | Task {task_id} haven't generate all audios. | Next round will be started. | (something get wrong) ")
+                        break
+    
+            if self.task_flag:  
+                generate_logger.info(f" | Task {task_id}: audio generation '{csv_name[:-4]}' has been completed. | ")  
+                generate_logger.info(f" | Start to ZIP all generated wav files. | ")  
+                start = time.time()  
+                zip_wav_files(output_path)  
+                end = time.time()  
+                generate_logger.info(f" | ZIP archive {task_id}.zip completed. zip time: {end-start}| ")  
+                self.task_flag = None  
+            else:  
+                self.task_flag = None  
+                generate_logger.info(f" | Task {task_id}: audio generation '{csv_name[:-4]}' has been stopped. | ")  
+        finally:
+            self.stop_event.set()  
+            self.monitor_thread.join()
         
     def stop_task(self) -> None:  
         """  

@@ -4,16 +4,13 @@ import math
 import time 
 import jiwer  
 import zipfile  
-import multiprocessing
 import pandas as pd  
 from typing import Dict, Set  
-from multiprocessing import Process, Queue  
 
 from lib.constant import Common, CSV_TMP
-from lib.log_config import setup_sys_logging, setup_whisper_logging
+from lib.log_config import setup_sys_logging
 from lib.base_object import BaseResponse  
 
-from api.threading_api import process_single_task
 
 logger = setup_sys_logging()  
   
@@ -148,15 +145,15 @@ def stop_task(task_id, generate_process, quality_process):
         generate_state = state_check(task_id, generate_process)
         quality_state = state_check(task_id, quality_process)
         if generate_state is None and quality_state is None:  
-            logger.info(f" | Task {task_id} all process has been stopped. | ")  
+            logger.info(f" | Task '{task_id}' all process has been stopped. | ")  
             return  
         time.sleep(5)  
         send_stop_flag(generate_process)
         send_stop_flag(quality_process)
-        logger.info(f" | Waiting for task {task_id} to stop... | ")  
+        logger.info(f" | Waiting for task '{task_id}' to stop... | ")  
         
-    logger.error(f" | Try to stop Task {task_id} has already 10 times. But nothing happens. | ")  
-    return BaseResponse(status="FAILED", message=f" | Failed | Try to stop Task {task_id} has already 10 times. But nothing happens. | ", data=False)  
+    logger.error(f" | Try to stop Task '{task_id}' has already 10 times. But nothing happens. | ")  
+    return BaseResponse(status="FAILED", message=f" | Failed | Try to stop Task '{task_id}' has already 10 times. But nothing happens. | ", data=False)  
 
 def split_csv(csv_file_path: str, num_parts: int):  
     horcruxes = []
@@ -180,27 +177,5 @@ def split_csv(csv_file_path: str, num_parts: int):
   
     return horcruxes  
 
-def create_and_start_process(task_id, single_generate_state):  
-    queue = Queue()  
-    generate_parent_conn, generate_child_conn = multiprocessing.Pipe()  
-    generate_process = Process(target=process_single_task, args=(task_id, generate_child_conn, queue))  
-    generate_process.start()  
-    single_generate_state["conn"] = generate_parent_conn  
-    single_generate_state["queue"] = queue  
-    
-    return single_generate_state
-  
-def start_service(task_id,single_generate_state):  
-    if single_generate_state["conn"] is not None:  
-        state = state_check([single_generate_state["conn"]])  
-        if isinstance(state, BaseResponse):  
-            return state  
-        elif not state:  
-            single_generate_state = create_and_start_process(task_id)  
-    else:  
-        single_generate_state = create_and_start_process(task_id) 
-        
-    return single_generate_state
-  
                     
     

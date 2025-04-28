@@ -1,11 +1,16 @@
 import os  
 import time
+import multiprocessing
+from multiprocessing import Process, Queue  
+
 from lib.constant import SPEAKERFOLDER
+from lib.base_object import BaseResponse
 from lib.log_config import setup_sys_logging, setup_whisper_logging
 
 from api.batch_inference import AudioGenerate
 from api.single_generate_service import SingleAudioGenerate
 from api.whisper_api import Model
+from api.utils import state_check
   
 # Setup logging  
 logger = setup_sys_logging()  
@@ -37,7 +42,14 @@ def process_batch_task(csv_file: str, output_path: str, task_id: str, quality_ch
             task_id=task_id,  
             quality_check=quality_check,  
         )  
+    except KeyboardInterrupt:  
+        audio_generator.stop_task()  
+        audio_generator.stop_event.set()  
+        audio_generator.monitor_thread.join()
     except Exception as e:  
+        audio_generator.stop_task()  
+        audio_generator.stop_event.set()  
+        audio_generator.monitor_thread.join()
         logger.error(f"| task ID {task_id} | Error processing batch task: {e} | ")  
   
 def quality_checking_task(task_id: str, child) -> None:  
@@ -71,15 +83,55 @@ def quality_checking_task(task_id: str, child) -> None:
     
     try:  
         model.quality_check(task_id)  
+    except KeyboardInterrupt:  
+        model.stop_task()  
+        model.stop_event.set()  
+        model.monitor_thread.join()
     except Exception as e:  
+        model.stop_task()  
+        model.stop_event.set()  
+        model.monitor_thread.join()
         logger.error(f"| task ID {task_id} | Error during quality checking: {e} | ")  
         
         
-def process_single_task(task_id: str, child, queue):
-    audio_generator = SingleAudioGenerate(child=child, queue=queue)
+def process_single_task(task_id: str, child, task_queue, audio_queue):
+    audio_generator = SingleAudioGenerate(child=child, task_queue=task_queue, audio_queue=audio_queue)
+    
     try:  
+        audio_generator.load_model()
         audio_generator.gen_audio()
+    except KeyboardInterrupt: 
+        audio_generator.stop_task()  
+        audio_generator.stop_event.set()  
+        audio_generator.monitor_thread.join()
     except Exception as e:  
+        audio_generator.stop_task()  
+        audio_generator.stop_event.set()  
+        audio_generator.monitor_thread.join()
         logger.error(f"| task ID {task_id} | Error processing batch task: {e} | ")  
 
+
+def create_and_start_process(task_id, single_generate_state):  
+    task_queue = Queue()  
+    audio_queue = Queue()  
+    generate_parent_conn, generate_child_conn = multiprocessing.Pipe()  
+    generate_process = Process(target=process_single_task, args=(task_id, generate_child_conn, task_queue, audio_queue))  
+    generate_process.start()  
+    single_generate_state["process"] = generate_process  
+    single_generate_state["conn"] = generate_parent_conn  
+    single_generate_state["task_queue"] = task_queue  
+    single_generate_state["audio_queue"] = audio_queue  
+    
+    return single_generate_state
+  
+def start_service(task_id, single_generate_state):  
+    if single_generate_state["conn"] is not None:  
+        state = state_check(task_id, [single_generate_state["conn"]])  
+        if isinstance(state, BaseResponse):  
+            return state  
+        elif not state:  
+            single_generate_state = create_and_start_process(task_id, single_generate_state)  
+    else:  
+        single_generate_state = create_and_start_process(task_id, single_generate_state) 
         
+    return single_generate_state

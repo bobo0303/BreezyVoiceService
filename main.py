@@ -9,6 +9,7 @@ import time
 import random
 import shutil  
 import signal  
+import atexit
 import zipfile  
 import uvicorn  
 import multiprocessing
@@ -16,8 +17,8 @@ from multiprocessing import Process, Queue
 from threading import Thread, Event  
 from datetime import datetime  
   
-from api.threading_api import process_batch_task, quality_checking_task
-from api.utils import load_file_list, zip_wav_files, state_check, stop_task, split_csv, start_service
+from api.threading_api import process_batch_task, quality_checking_task, start_service
+from api.utils import load_file_list, zip_wav_files, state_check, stop_task, split_csv
 
 from lib.constant import OUTPUTPATH, CSV_TMP, CSV_HEADER_FORMAT, SPEAKERFOLDER, CUSTOMSPEAKERPATH, SPEAKERS, QUALITY_PASS_TXT, QUALITY_FAIL_TXT
 from lib.base_object import BaseResponse  
@@ -30,8 +31,10 @@ from lib.log_config import setup_sys_logging
 app = FastAPI()  
 task_manager = {}
 single_generate_state = {
+    "process": None,
     "conn": None,
-    "queue": None,
+    "task_queue": None,
+    "audio_queue": None,
     "usage_list": [],
     "readied_audio": [],
 }
@@ -118,6 +121,12 @@ def audio_quantity(task_id: str):
     else:
         state = "stopped"  
         logger.info(f" | Task is stopped. | task ID: {task_id} | ") 
+        
+    if task_id in single_generate_state["usage_list"]:
+        quality_state  = state_check(task_id, [single_generate_state["conn"]])
+        single_generate_service_state = "running" if quality_state else "stopped"
+    else:
+        single_generate_service_state = "stopped"  
 
     csv_file_path = os.path.join(CSV_TMP, task_id + ".csv")  
     with open(csv_file_path, mode='r', encoding='utf-8') as file:  
@@ -134,7 +143,8 @@ def audio_quantity(task_id: str):
         "audio_count": audio_count,  
         "keep": keep_num,  
         "delete": delete_num,  
-        "unprocessed": unprocessed_num  
+        "unprocessed": unprocessed_num,
+        "single_generate_service_state": single_generate_service_state,
     }  
       
     return BaseResponse(status="OK", message=f" | Task {task_id} is {state}. | progress: {progress}% | not audio: {audio_count} | keep: {keep_num} | del: {delete_num} | unprocessed: {unprocessed_num} | ", data=return_info)  
@@ -389,6 +399,11 @@ def delete_task(task_id: str):
         logger.info(f" | removed '{csv_file}' | ")
         os.remove(csv_file)  
         
+    csv_files = os.listdir(CSV_TMP)
+    for file in csv_files:
+        if file.startswith(task_id+"_horcrux"):
+            os.remove(os.path.join(CSV_TMP, file))  
+        
     custom_speaker_json = os.path.join(CUSTOMSPEAKERPATH, task_id+".json")
     if os.path.isfile(custom_speaker_json):
         with open(custom_speaker_json, 'r') as speakers_file:  
@@ -588,9 +603,9 @@ def start_single_generate_service(task_id: str):
         single_generate_state["usage_list"].append(task_id)
 
     try:
-        single_generate_state = start_service(task_id, single_generate_state)
-        if isinstance(single_generate_state, BaseResponse):  
-            return single_generate_state  
+        sg_state = start_service(task_id, single_generate_state)
+        if isinstance(sg_state, BaseResponse):  
+            return sg_state  
     except Exception as e:  
         logger.error(f" | An error occurred when start service : {e} | task ID: {task_id} | ")  
         return BaseResponse(status="FAILED", message=f" | An error occurred when start service : {e} | task ID: {task_id} | ", data=False)
@@ -606,9 +621,11 @@ async def single_generate(
 ):  
     # check service is ready if not start it
     try:
-        single_generate_state = start_service(task_id, single_generate_state)
-        if isinstance(single_generate_state, BaseResponse):  
-            return single_generate_state  
+        if task_id not in single_generate_state["usage_list"]:
+            single_generate_state["usage_list"].append(task_id)
+        sg_state = start_service(task_id, single_generate_state)
+        if isinstance(sg_state, BaseResponse):  
+            return sg_state  
     except Exception as e:  
         logger.error(f" | An error occurred when start service : {e} | task ID: {task_id} | ")  
         return BaseResponse(status="FAILED", message=f" | An error occurred when start service : {e} | task ID: {task_id} | ", data=False)
@@ -638,7 +655,7 @@ async def single_generate(
     # name output file
     now = datetime.now()  
     current_time = now.strftime("%Y-%m-%d_%H-%M-%S")  
-    output_name = f"{task_id}_{speaker_name}_{current_time}"
+    output_name = f"{task_id}_{speaker_name[:-4]}_{current_time}.wav"
     
     info = {
         "task_id": task_id,
@@ -648,30 +665,89 @@ async def single_generate(
         "output_name": output_name,
     }
     
-    if single_generate_state["queue"] is not None:
-        single_generate_state["queue"].put(info)
+    if single_generate_state["task_queue"] is not None:
+        single_generate_state["task_queue"].put(info)
     else:
         logger.error(f" | something got wrong: single generate service not found | ")
         return BaseResponse(status="FAILED", message=f" | something got wrong: single generate service not found | ", data=False) 
     
+    logger.info(f" | task '{task_id}' generate mission received | ")
+    return BaseResponse(status="OK", message=f" | task '{task_id}' generate mission received | later use get(/get_single_audio) to get result | ", data=True) 
+    
+    """
     # get return audio
     for _ in range(5):
         time.sleep(5)
         if single_generate_state["conn"].poll(): 
             single_generate_state["readied_audio"].append(single_generate_state["conn"].recv())
-        # self.task_flags: dict[str, bool] = {}  
+
         for ready_file in single_generate_state["readied_audio"]:
             if ready_file.get(task_id):
                 audio = ready_file.get(task_id)
                 logger.info(f" | Get audio {os.path.basename(audio)} from single inference. | ")
-                return FileResponse(audio, media_type='audio/wav', filename=f"{output_name}.wav")  
+                return FileResponse(audio, media_type='audio/wav', filename=f"{output_name}")  
 
     logger.info(f" | task '{task_id}: ' time out | ")
     return BaseResponse(status="FAILED", message=f" | task '{task_id}: ' time out | ", data=False) 
+    """ 
+    
+@app.get("/get_single_audio")
+def get_single_audio(task_id: str):
+    
+    try:
+        if single_generate_state['audio_queue']:
+            while not single_generate_state['audio_queue'].empty():
+                audio_info = single_generate_state['audio_queue'].get()
+                if audio_info not in single_generate_state["readied_audio"]:
+                    single_generate_state["readied_audio"].append(audio_info)
+        else:
+            logger.info(" | single generate service has not been started. please start first | ")
+            return BaseResponse(status="FAILED", message=f" | single generate service has not been started. please start first | ", data=False) 
+    except BrokenPipeError as e:
+        logger.info(" | single generate service has not been started. please start first | ")
+        return BaseResponse(status="FAILED", message=f" | single generate service has not been started. please start first | ", data=False) 
+    except ConnectionResetError as e:  
+        logger.info(" | single generate service has not been started. please start first | ")
+        return BaseResponse(status="FAILED", message=f" | single generate service has not been started. please start first | ", data=False) 
+    except Exception as e:  
+        logger.error(" | An error occurred when get single audio : {e} | task ID: {task_id} | ")
+        return BaseResponse(status="FAILED", message=f" |  An error occurred when get single audio : {e} | task ID: {task_id} | ", data=False) 
+
+    if task_id not in single_generate_state["usage_list"]:
+        logger.info(f" | task '{task_id}' not in usage list please choose a speaker and generate audio first. | ")
+        return BaseResponse(status="FAILED", message=f" |  An error occurred when get single audio : {e} | task ID: {task_id} | ", data=False) 
+        
+    for ready_file in single_generate_state["readied_audio"]:
+        if ready_file.get(task_id):
+            audio = ready_file.get(task_id)
+            logger.info(f" | Get audio {os.path.basename(audio)} from single inference. | ")
+            return FileResponse(audio, media_type='audio/wav', filename=f"{os.path.basename(audio)}")  
+    
+    logger.info(f" | task '{task_id}' haven't finish generate please try again later | ")
+    return BaseResponse(status="OK", message=f" | task '{task_id}' haven't finish generate please try again later | ", data=True) 
+
 
 @app.post("/stop_single_generate_service")
-def stop_single_generate_service():
-    return
+def stop_single_generate_service(
+    task_id: str = Form(...),
+    ):
+    if task_id in single_generate_state["usage_list"]:
+        single_generate_state["usage_list"].remove(task_id)
+        logger.info(f" | Got task '{task_id}' | removed from usage list | ")
+    else:
+        logger.info(f" | task '{task_id}' not in usage list | skip end process | ")
+        return BaseResponse(status="OK", message=f" | task '{task_id}' not in usage list | skip end process | ", data=True) 
+    
+    if single_generate_state["usage_list"] == []:
+        logger.info(f" | No task in usage list. Start to end the single generate service | ")
+        stop_info = stop_task(task_id, [single_generate_state["conn"]], [None])
+        if stop_info:
+            return stop_info  
+        else:
+            logger.info(f" | single generate service has been closed | ")
+            return BaseResponse(status="OK", message=f" | Got task '{task_id}' | removed from usage list and no task in usage closed single generate service | ", data=True) 
+    
+    return BaseResponse(status="OK", message=f" | Got task '{task_id}' | removed from usage list | ", data=True) 
 
 ##############################################################################  
   
@@ -685,17 +761,18 @@ def delete_old_audio_files():
     :logs: Deleted old files  
     """  
     current_time = time.time()  
-    audio_dir = "./audio"  
-    for filename in os.listdir(audio_dir):  
-        if filename == "test.wav":  # Skip specific file  
-            continue  
-        file_path = os.path.join(audio_dir, filename)  
-        if os.path.isfile(file_path):  
-            file_creation_time = os.path.getctime(file_path)  
-            # Delete files older than a day  
-            if current_time - file_creation_time > 24 * 60 * 60:  
-                os.remove(file_path)  
-                logger.info(f"Deleted old file: {file_path}")  
+    audio_dirs = ["./audio", os.path.join(OUTPUTPATH,"tmp")]
+    for audio_dir in audio_dirs:
+        for filename in os.listdir(audio_dir):  
+            if filename == "test.wav":  # Skip specific file  
+                continue  
+            file_path = os.path.join(audio_dir, filename)  
+            if os.path.isfile(file_path):  
+                file_creation_time = os.path.getctime(file_path)  
+                # Delete files older than a day  
+                if current_time - file_creation_time > 24 * 60 * 60:  
+                    os.remove(file_path)  
+                    logger.info(f"Deleted old file: {file_path}")  
   
 # Daily task scheduling  
 def schedule_daily_task(stop_event, local_now):  
@@ -718,20 +795,21 @@ def handle_exit(sig, frame):
     """  
     stop_event.set()  
     task_thread.join()  
+    if single_generate_state["usage_list"] != []:
+        single_generate_state["process"].join()
     logger.info("Scheduled task has been stopped.")  
     os._exit(0)  
 
-  
-@app.on_event("shutdown")  
-def shutdown_event():  
-    """   
-    FastAPI shutdown event handler to stop background tasks and clean up temporary files.  
-    """  
-    handle_exit(None, None)  
-    stop_event.set()  
-    task_thread.join()  
-    logger.info("Scheduled task has been stopped.")  
-  
+# @app.on_event("shutdown")  
+# def shutdown_event():  
+#     """   
+#     FastAPI shutdown event handler to stop background tasks and clean up temporary files.  
+#     """  
+#     handle_exit(None, None)  
+#     stop_event.set()  
+#     task_thread.join()  
+#     logger.info("Scheduled task has been stopped.")  
+    
 if __name__ == "__main__":  
     multiprocessing.set_start_method('spawn') 
     logger, tz, local_now = initialize_logging_and_directories()
@@ -746,6 +824,6 @@ if __name__ == "__main__":
     
     port = int(os.environ.get("PORT", 80))  
     uvicorn.run(app, log_level='info', host='0.0.0.0', port=port)  
-    
+
     
      
