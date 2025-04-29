@@ -1,14 +1,15 @@
-import os  
+import os
 import time
 import multiprocessing
 from multiprocessing import Process, Queue  
+from watchdog.events import FileSystemEventHandler 
 
 from lib.constant import SPEAKERFOLDER
 from lib.base_object import BaseResponse
 from lib.log_config import setup_sys_logging, setup_whisper_logging
 
 from api.batch_inference import AudioGenerate
-from api.single_generate_service import SingleAudioGenerate
+from api.custom_audio_generate import SingleAudioGenerate
 from api.whisper_api import Model
 from api.utils import state_check
   
@@ -52,7 +53,7 @@ def process_batch_task(csv_file: str, output_path: str, task_id: str, quality_ch
         audio_generator.monitor_thread.join()
         logger.error(f"| task ID {task_id} | Error processing batch task: {e} | ")  
   
-def quality_checking_task(task_id: str, child) -> None:  
+def quality_checking_task(task_id: str, child, audio_queue) -> None:  
     """  
     Perform quality check on the audio files of a specific task.  
       
@@ -63,7 +64,7 @@ def quality_checking_task(task_id: str, child) -> None:
     :rtype: None  
     :logs: Quality check status and errors.  
     """  
-    model = Model(child=child)
+    model = Model(child=child, audio_queue=audio_queue)
 
     # Directly load the default model  
     whisper_logger.info(" | ########################################################### | ")  
@@ -96,7 +97,6 @@ def quality_checking_task(task_id: str, child) -> None:
         
 def process_single_task(task_id: str, child, task_queue, audio_queue):
     audio_generator = SingleAudioGenerate(child=child, task_queue=task_queue, audio_queue=audio_queue)
-    
     try:  
         audio_generator.load_model()
         audio_generator.gen_audio()
@@ -135,3 +135,26 @@ def start_service(task_id, single_generate_state):
         single_generate_state = create_and_start_process(task_id, single_generate_state) 
         
     return single_generate_state
+
+class NewAudioCreate(FileSystemEventHandler):  
+    """
+    A watchdog event handler that retains only the latest model checkpoint file.
+    """
+    def __init__(self, audio_queue):  
+        super().__init__()  
+        self.audio_queue = audio_queue
+        
+    def on_created(self, event):  
+        """
+        Called when a new file is created. Cleans up older checkpoints, retains the latest.
+
+        :param event
+            The file system event object containing event information.
+        :return: None
+        """
+        if event.is_directory:  
+            return None  
+        else:  
+            if event.src_path.endswith(('.wav')):  
+                self.audio_queue.put(os.path.basename(event.src_path))
+                # whisper_logger.info(f" | New audio create: {event.src_path} | ")

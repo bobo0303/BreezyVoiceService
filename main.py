@@ -9,15 +9,15 @@ import time
 import random
 import shutil  
 import signal  
-import atexit
 import zipfile  
 import uvicorn  
 import multiprocessing
 from multiprocessing import Process, Queue  
+from datetime import datetime
 from threading import Thread, Event  
-from datetime import datetime  
+from watchdog.observers import Observer  
   
-from api.threading_api import process_batch_task, quality_checking_task, start_service
+from api.threading_api import process_batch_task, quality_checking_task, start_service, NewAudioCreate
 from api.utils import load_file_list, zip_wav_files, state_check, stop_task, split_csv
 
 from lib.constant import OUTPUTPATH, CSV_TMP, CSV_HEADER_FORMAT, SPEAKERFOLDER, CUSTOMSPEAKERPATH, SPEAKERS, QUALITY_PASS_TXT, QUALITY_FAIL_TXT
@@ -318,11 +318,17 @@ async def batch_generate(
     
     quality_parent_conns = []
     if quality_check:  
+        audio_queue = Queue()
         quality_parent_conn, quality_child_conn = multiprocessing.Pipe()
-        quality_process = Process(target=quality_checking_task, args=(task_id, quality_child_conn))  
+        quality_process = Process(target=quality_checking_task, args=(task_id, quality_child_conn, audio_queue))  
         quality_process.start()  
+        event_handler = NewAudioCreate(audio_queue)
+        observer = Observer()  
+        observer.schedule(event_handler, path=output_path, recursive=False)
+        observer.start()  
     else:  
         quality_parent_conn = None
+        observer = None
         passed_list = os.path.join(output_path, QUALITY_PASS_TXT)  
         failed_list = os.path.join(output_path, QUALITY_FAIL_TXT)  
         if os.path.exists(passed_list):  
@@ -333,7 +339,7 @@ async def batch_generate(
     quality_parent_conns.append(quality_parent_conn)
     
     # add task into task manager 
-    task_manager[task_id] = {"generate": generate_parent_conns, "quality": quality_parent_conns}
+    task_manager[task_id] = {"generate": generate_parent_conns, "quality": quality_parent_conns, "watchdog": observer} 
     
     return BaseResponse(status="OK", message=f" | batch generation started. | task ID: {task_id} | ", data=task_id) 
 
@@ -367,6 +373,13 @@ def cancel_task(task_id: str):
     stop_info = stop_task(task_id, task_manager[task_id]["generate"], task_manager[task_id]["quality"])  
     if stop_info:
         return stop_info
+    try:
+        if task_manager[task_id]["watchdog"]:
+            task_manager[task_id]["watchdog"].stop()  
+            task_manager[task_id]["watchdog"].join()  
+    except Exception as e:
+        logger.error(f" | Error stopping watchdog: {e} | ")  
+        return BaseResponse(status="FAILED", message=f" | Error stopping watchdog: {e} | ", data=False)
     
     return BaseResponse(status="OK", message=f" | task ID: {task_id} | all process has been stopped. | ", data=True)  
   
@@ -584,7 +597,7 @@ def speaker_list(task_id: str):
     if task_id:
         custom_speaker_json = os.path.join(CUSTOMSPEAKERPATH, task_id+".json")
         if os.path.isfile(custom_speaker_json):
-            logger.info(f" | Found custom apeakers. Start to load custom speakers | ")  
+            logger.info(f" | Found custom speakers. Start to load custom speakers | ")  
             with open(custom_speaker_json, 'r') as speakers_file:  
                 custom_speakers = json.load(speakers_file)  
                 for speaker in custom_speakers:
@@ -800,20 +813,10 @@ def handle_exit(sig, frame):
     logger.info("Scheduled task has been stopped.")  
     os._exit(0)  
 
-# @app.on_event("shutdown")  
-# def shutdown_event():  
-#     """   
-#     FastAPI shutdown event handler to stop background tasks and clean up temporary files.  
-#     """  
-#     handle_exit(None, None)  
-#     stop_event.set()  
-#     task_thread.join()  
-#     logger.info("Scheduled task has been stopped.")  
-    
 if __name__ == "__main__":  
     multiprocessing.set_start_method('spawn') 
     logger, tz, local_now = initialize_logging_and_directories()
-    
+
     # Start daily task scheduling  
     stop_event = Event()  
     task_thread = Thread(target=schedule_daily_task, args=(stop_event, local_now))  

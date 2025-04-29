@@ -6,7 +6,7 @@ import whisper
 import threading
 from opencc import OpenCC  
 from typing import Optional  
-  
+
 from lib.constant import ModelPath, Common, OPTIONS, QUALITY_PASS_TXT, QUALITY_FAIL_TXT, QUALITY_THRESHOLD, CSV_TMP, OUTPUTPATH  
 from lib.log_config import setup_sys_logging, setup_whisper_logging  
 from api.utils import calculate_cer, load_csv_data, load_file_list, save_file_list  
@@ -16,9 +16,11 @@ cc = OpenCC('s2t')
   
 whisper_logger = setup_whisper_logging()  
 logger = setup_sys_logging()  
-  
+
+
+                
 class Model:  
-    def __init__(self, child):  
+    def __init__(self, child, audio_queue):  
         """  
         Initialize the Model class with default attributes.  
         """  
@@ -27,6 +29,7 @@ class Model:
         self.models_path: ModelPath = ModelPath()  
         self.task_flag: Optional[bool] = None  
         self.child = child
+        self.audio_queue = audio_queue
         self.stop_event = threading.Event()  
         self.monitor_thread = threading.Thread(target=self.monitor_pipe)  
         self.monitor_thread.start()   
@@ -174,41 +177,49 @@ class Model:
         :logs: Quality check progress and results.  
         """  
         self.task_flag = True  
-
         
         output_path = os.path.join(OUTPUTPATH, task_id)  
         passed_list = os.path.join(output_path, QUALITY_PASS_TXT)  
         failed_list = os.path.join(output_path, QUALITY_FAIL_TXT)  
         csv_file_path = os.path.join(CSV_TMP, task_id + ".csv")  
-          
+        
+        # load file
         data = load_csv_data(csv_file_path)  
-        total_audio_num = len(data)  
-          
         keep_files = load_file_list(passed_list)  
         delete_files = load_file_list(failed_list)  
-          
-        while self.task_flag:  
-            if self.task_flag:  
-                audio_files = [f for f in os.listdir(output_path) if f.endswith('.wav')]  
-                  
-                if len(keep_files) == total_audio_num:  
-                    whisper_logger.info(f" | Task {task_id}: audio checking has been completed. | ")  
-                    self.task_flag = None  
-                    break  
-              
-            for audio in audio_files:  
-                if self.task_flag:  
-                    if audio in keep_files:  
-                        continue  
-                    self._process_audio_file(audio, output_path, data, keep_files, delete_files, passed_list, failed_list)  
-                else:  
-                    whisper_logger.info(f" | Task {task_id}: audio checking has been stopped. | ")  
-                    self.task_flag = None  
-                    break  
-                
-        self.stop_event.set()  
-        self.monitor_thread.join()
-  
+        total_audio_num = len(data)  
+        
+        # put unprocessed audio
+        audio_files = {f for f in os.listdir(output_path) if f.endswith('.wav')}  
+        unprocessed_audio = list(audio_files - keep_files)
+        for audio in unprocessed_audio:
+            self.audio_queue.put(audio)
+
+        # start quality check
+        try:
+            while self.task_flag:  
+                if not self.audio_queue.empty():
+                    audio = self.audio_queue.get()
+                    whisper_logger.info(f" | Task {task_id}: processing audio file {audio} | ")
+                    if audio in keep_files:
+                        continue
+                    self._process_audio_file(audio, output_path, data, keep_files, delete_files, passed_list, failed_list)
+                else:
+                    if len(keep_files) == total_audio_num:  
+                        whisper_logger.info(f" | Task {task_id}: audio checking has been completed. | ")  
+                        self.task_flag = None  
+                        break  
+                    time.sleep(0.1)
+            if self.task_flag is False:  
+                whisper_logger.info(f" | Task {task_id}: audio checking has been stopped. | ")  
+                self.task_flag = None
+        except KeyboardInterrupt:
+            self.stop_event.set()  
+            self.monitor_thread.join()
+        finally:
+            self.stop_event.set()  
+            self.monitor_thread.join()
+        
     def stop_task(self) -> None:  
         """  
         Stop a running task.  
