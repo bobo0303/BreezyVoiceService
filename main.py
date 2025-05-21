@@ -711,8 +711,22 @@ def get_single_audio(task_id: str):
         if single_generate_state['audio_queue']:
             while not single_generate_state['audio_queue'].empty():
                 audio_info = single_generate_state['audio_queue'].get()
-                if audio_info not in single_generate_state["readied_audio"]:
-                    single_generate_state["readied_audio"].append(audio_info)
+                # get current task id
+                current_task_id = next(iter(audio_info))
+                
+                existing_index = -1  
+                # check if task id already in readied audio
+                for idx, item in enumerate(single_generate_state["readied_audio"]):  
+                    if current_task_id in item:  
+                        existing_index = idx  
+                        break  
+                    
+                # if task id already in readied audio, update it
+                if existing_index >= 0:  
+                    single_generate_state["readied_audio"][existing_index] = audio_info  
+                # if task id not in readied audio, append it
+                else:  
+                    single_generate_state["readied_audio"].append(audio_info)  
         else:
             logger.info(" | single generate service has not been started. please start first | ")
             return BaseResponse(status="FAILED", message=f" | single generate service has not been started. please start first | ", data=False) 
