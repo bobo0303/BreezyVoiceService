@@ -1,5 +1,6 @@
 import os  
 import time  
+import queue  
 import threading
 from typing import Optional 
 
@@ -69,7 +70,22 @@ class SingleAudioGenerate:
             self.stop_event.set()  
             self.monitor_thread.join()
     
+    def _remove_existing_task(self, task_id):  
+        # Create a temporary list to hold items that are not being removed  
+        temp_list = []  
+          
+        # Transfer items from the original queue to the temporary list  
+        while not self.audio_queue.empty():  
+            item = self.audio_queue.get()  
+            if task_id not in item:  
+                temp_list.append(item)  
+          
+        # Transfer items back from the temporary list to the original queue  
+        for item in temp_list:  
+            self.audio_queue.put(item)
+    
     def send_audio(self, task_id, output_audio):
+        self._remove_existing_task(task_id)  
         send_dict = {task_id: output_audio}
         generate_logger.info(f" | task {task_id}: single generate finished put audio {os.path.basename(output_audio)} in audio queue | ")
         self.audio_queue.put(send_dict)

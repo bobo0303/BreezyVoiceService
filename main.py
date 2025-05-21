@@ -724,12 +724,13 @@ def get_single_audio(task_id: str):
         return BaseResponse(status="FAILED", message=f" | single generate service has not been started. please start first | ", data=False) 
     except Exception as e:  
         logger.error(" | An error occurred when get single audio : {e} | task ID: {task_id} | ")
-        return BaseResponse(status="FAILED", message=f" |  An error occurred when get single audio : {e} | task ID: {task_id} | ", data=False) 
+        return BaseResponse(status="FAILED", message=f" | An error occurred when get single audio : {e} | task ID: {task_id} | ", data=False) 
 
     if task_id not in single_generate_state["usage_list"]:
         logger.info(f" | task '{task_id}' not in usage list please choose a speaker and generate audio first. | ")
-        return BaseResponse(status="FAILED", message=f" |  An error occurred when get single audio : {e} | task ID: {task_id} | ", data=False) 
-        
+        return BaseResponse(status="FAILED", message=f" | task '{task_id}' not in usage list please choose a speaker and generate audio first. | task ID: {task_id} | ", data=False) 
+    
+    print(single_generate_state["readied_audio"])        
     for ready_file in single_generate_state["readied_audio"]:
         if ready_file.get(task_id):
             audio = ready_file.get(task_id)
