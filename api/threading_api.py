@@ -51,7 +51,8 @@ def process_batch_task(csv_file: str, output_path: str, task_id: str, quality_ch
         audio_generator.stop_task()  
         audio_generator.stop_event.set()  
         audio_generator.monitor_thread.join()
-        logger.error(f"| task ID {task_id} | Error processing batch task: {e} | ")  
+        csv_name = os.path.basename(csv_file)
+        logger.error(f"| task ID {task_id} | Error processing batch task '{csv_name[:-4]}': {e} | ")  
   
 def quality_checking_task(task_id: str, child, audio_queue) -> None:  
     """  

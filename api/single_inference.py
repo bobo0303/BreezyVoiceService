@@ -210,7 +210,7 @@ class CustomCosyVoice:
         
         if not os.path.exists(model_dir):
             model_dir = snapshot_download(model_dir)
-        generate_logger.info(f"model {model_dir}")
+        # generate_logger.info(f"model {model_dir}")
         self.model_dir = model_dir
         
         with open('{}/cosyvoice.yaml'.format(model_dir), 'r') as f:

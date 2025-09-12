@@ -38,3 +38,8 @@ whl/g2pw-0.1.1-py3-none-any.whl #  Special g2pW (num_works = 0)
  https://www.modelscope.cn/models/speech_tts/speech_kantts_ttsfrd/resolve/master/ttsfrd-0.3.9-cp310-cp310-linux_x86_64.whl
  
  jiwer
+
+# view
+jinja2
+
+

@@ -1,6 +1,5 @@
 import os  
 import time  
-import argparse  
 import threading
 import pandas as pd  
 from typing import Optional  
@@ -81,10 +80,14 @@ class AudioGenerate:
                 output_audio_path = os.path.join(output_path, f"{row['output_audio_filename']}.wav")  
   
                 if not os.path.exists(speaker_prompt_audio_path):  
-                    logger.error(f"File {speaker_prompt_audio_path} does not exist")  
+                    logger.error(f" | File {speaker_prompt_audio_path} does not exist | ")  
                     return row  # {"status": "failed", "reason": "file not found"}  
                 if not os.path.exists(output_audio_path):  
-                    single_inference(speaker_prompt_audio_path, content_to_synthesize, output_audio_path, customcosyvoice, bopomofo_converter, speaker_prompt_text_transcription)  
+                    try:
+                        single_inference(speaker_prompt_audio_path, content_to_synthesize, output_audio_path, customcosyvoice, bopomofo_converter, speaker_prompt_text_transcription)  
+                    except Exception as e:
+                        logger.error(f" | Error generating audio for {output_audio_path}: {e} | ")  
+                        return row
         try:
             while self.task_flag:
                 # Traverse the entire data to generate audio files

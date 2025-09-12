@@ -9,6 +9,7 @@ OUTPUTPATH = "/tmp/audio_output/"
 CUSTOMSPEAKERPATH = "/tmp/custom_speaker"
 CSV_TMP = "/tmp/csv_folder"  
 CSV_HEADER_FORMAT =  ['speaker_prompt_audio_filename', 'speaker', 'speaker_prompt_text_transcription', 'content_to_synthesize', 'output_audio_filename']  
+LOGPATH = "logs/"
 
 #############################################################################
 

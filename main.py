@@ -1,5 +1,7 @@
 from fastapi import FastAPI, UploadFile, File, Form  
-from fastapi.responses import FileResponse  
+from fastapi.responses import HTMLResponse, FileResponse  
+from fastapi.middleware.cors import CORSMiddleware  
+import re  
 import io
 import os  
 import csv  
@@ -11,6 +13,7 @@ import shutil
 import signal  
 import zipfile  
 import uvicorn  
+import subprocess  
 import multiprocessing
 from multiprocessing import Process, Queue  
 from datetime import datetime
@@ -20,7 +23,7 @@ from watchdog.observers import Observer
 from api.threading_api import process_batch_task, quality_checking_task, start_service, NewAudioCreate
 from api.utils import load_file_list, zip_wav_files, state_check, stop_task, split_csv
 
-from lib.constant import OUTPUTPATH, CSV_TMP, CSV_HEADER_FORMAT, SPEAKERFOLDER, CUSTOMSPEAKERPATH, SPEAKERS, QUALITY_PASS_TXT, QUALITY_FAIL_TXT
+from lib.constant import OUTPUTPATH, CSV_TMP, LOGPATH, CSV_HEADER_FORMAT, SPEAKERFOLDER, CUSTOMSPEAKERPATH, SPEAKERS, QUALITY_PASS_TXT, QUALITY_FAIL_TXT
 from lib.base_object import BaseResponse  
 from lib.log_config import setup_sys_logging  
 
@@ -29,6 +32,15 @@ from lib.log_config import setup_sys_logging
   
 # Initialize FastAPI app and global variable
 app = FastAPI()  
+
+app.add_middleware(  
+    CORSMiddleware,  
+    allow_origins=["*"],
+    allow_credentials=True,  
+    allow_methods=["*"],  
+    allow_headers=["*"],  
+)  
+
 task_manager = {}
 single_generate_state = {
     "process": None,
@@ -38,6 +50,9 @@ single_generate_state = {
     "usage_list": [],
     "readied_audio": [],
 }
+
+# Track usage list history for cleanup
+usage_list_history = {}
   
 #############################################################################  
   
@@ -99,9 +114,9 @@ def audio_quantity(task_id: str):
     logger.info(f" | Get task ID: {task_id} | ")  
     audio_files = [f for f in os.listdir(output_path) if f.endswith('.wav')]  
     audio_count = len(audio_files)  
-      
-    keep_num = len(load_file_list(passed_list))  
-    delete_num = len(load_file_list(failed_list))  
+
+    keep_num = len(load_file_list(passed_list)) if os.path.isfile(passed_list) else 0
+    delete_num = len(load_file_list(failed_list)) if os.path.isfile(failed_list) else 0
     unprocessed_num = audio_count - keep_num  
     
     if task_manager.get(task_id):
@@ -147,7 +162,7 @@ def audio_quantity(task_id: str):
         "single_generate_service_state": single_generate_service_state,
     }  
       
-    return BaseResponse(status="OK", message=f" | Task {task_id} is {state}. | progress: {progress}% | not audio: {audio_count} | keep: {keep_num} | del: {delete_num} | unprocessed: {unprocessed_num} | ", data=return_info)  
+    return BaseResponse(status="OK", message=f" | Task {task_id} is {state}. | progress: {progress}% | now audio: {audio_count} | keep: {keep_num} | del: {delete_num} | unprocessed: {unprocessed_num} | ", data=return_info)  
   
 @app.post("/custom_speaker_upload")  
 async def custom_speaker_upload(task_id: str, file: UploadFile = File(...)):  
@@ -225,6 +240,7 @@ async def csv_check(csv_file: UploadFile = File(...)):
         A response object indicating whether the CSV format is correct.  
     """  
     csv_file_path = os.path.join(CSV_TMP, csv_file.filename[:-4]+"_checkingfile.csv")  
+    logger.info(f" | Start to check csv format | ")
     
     if not csv_file.filename.endswith(".csv"):
         logger.error(f" | Upload file should be .csv please check again | ")  
@@ -268,7 +284,7 @@ async def batch_generate(
     csv_file: UploadFile = File(...),  
     task_id: str = Form(...),  
     quality_check: bool = Form(...),  
-    num_thread: int = 3,  
+    num_thread: str = Form("3"),  
 ):  
     """   
     Start batch audio generation based on a CSV file.  
@@ -299,7 +315,7 @@ async def batch_generate(
     with open(csv_file_path, "wb") as buffer:  
         buffer.write(await csv_file.read())  
     
-    csv_horcruxes = split_csv(csv_file_path, num_thread)
+    csv_horcruxes = split_csv(csv_file_path, int(num_thread))
       
     output_path = os.path.join(OUTPUTPATH, task_id)  
       
@@ -479,7 +495,7 @@ def get_audio(task_id: str):
             logger.error(f"Error zipping files for task {task_id}: {e}")  
             return BaseResponse(status="FAILED", message=f"Error zipping files: {e}", data=False)  
         end = time.time()  
-        logger.info(f" | ZIP archive {task_id}.zip completed. zip time: {end-start} | ")  
+        logger.info(f" | ZIP archive {task_id}.zip completed. zip time: {end-start}  | ")  
       
     logger.info(f" | Try to download '{task_id}.zip'. | ")  
     return FileResponse(zip_file, media_type='application/zip', filename=f"{task_id}.zip")  
@@ -568,7 +584,7 @@ def txt2csv(task_id: str =  None , expansion_ratio: float = 1.0, file: UploadFil
     # Write into CSV format  
     logger.info(f" | Start to write into csv format | ")  
     try:  
-        csv_filename = os.path.join(CSV_TMP, f"{task_id}.csv")  
+        csv_filename = os.path.join(CSV_TMP, f"{task_id}_generated.csv")  
         with open(csv_filename, 'w', newline='') as csv_file:  
             writer = csv.writer(csv_file)  
             writer.writerow(CSV_HEADER_FORMAT)
@@ -611,7 +627,7 @@ def speaker_list(task_id: str):
     return BaseResponse(status="OK", message=f" | Total '{speaker_num}' speakers found | ", data=speaker_list) 
 
 @app.post("/start_single_generate_service")
-def start_single_generate_service(task_id: str):
+def start_single_generate_service(task_id: str = Form(...)):
     if task_id not in single_generate_state["usage_list"]:
         single_generate_state["usage_list"].append(task_id)
 
@@ -778,7 +794,203 @@ def stop_single_generate_service(
     return BaseResponse(status="OK", message=f" | Got task '{task_id}' | removed from usage list | ", data=True) 
 
 ##############################################################################  
-  
+
+@app.get("/thread_suggestion")
+def thread_suggestion(
+    ):
+    try:  
+        result = subprocess.run(['nvidia-smi', '--query-gpu=memory.free', '--format=csv,noheader,nounits'],  
+                                stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, check=True)  
+          
+        memory_free = [int(x) for x in result.stdout.strip().split('\n')]  
+        memory = sum(memory_free)
+        available_thread = int(memory // 16 // 1024)
+        available_thread = available_thread if available_thread <= 3 else 3
+        if available_thread <= 0:
+            logger.error(" | No available GPU memory for processing. | ")
+            return BaseResponse(status="FAILED", message=f" | No available GPU memory. | ", data=None)
+        logger.info(f" | Available GPU memory: {memory} MB | Suggested threads: {available_thread} | ")
+        return BaseResponse(status="OK", message=f" | Available GPU memory: {memory} MB | Suggested threads: {available_thread} | ", data=available_thread)
+    except subprocess.CalledProcessError as e:  
+        logger.error("An error occurred while trying to query GPU memory:", e)  
+        return BaseResponse(status="FAILED", message=f" | An error occurred while trying to query GPU memory: {e} | ", data=None)
+
+@app.get("/show_logs")
+def show_logs():
+    """   
+    Show the latest logs from the log file.  
+      
+    :return: BaseResponse  
+        A response object containing the latest logs.  
+    """  
+    log_file_path = os.path.join(LOGPATH, "generate.log")  
+    if not os.path.exists(log_file_path):  
+        logger.error(f" | Log file not found: {log_file_path} | ")  
+        return BaseResponse(status="FAILED", message=f" | Log file not found: {log_file_path} | ", data=None)  
+    
+    try:  
+        with open(log_file_path, 'r') as log_file:  
+            logs = log_file.readlines()[-100:]  
+            LOG_PATTERN = re.compile(r'(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}) - generate_logger - INFO - (.*)')  
+            cleaned_logs = []  
+            for log in logs:  
+                match = LOG_PATTERN.match(log)  
+                if match:  
+                    timestamp, message = match.groups()  
+                    cleaned_logs.append(f"{timestamp} - {message.strip()}")  
+                else:  
+                    logger.debug(f"No match for line: {log.strip()}")   
+        return BaseResponse(status="OK", message=" | Latest logs retrieved successfully | ", data=cleaned_logs)  
+    except Exception as e:  
+        logger.error(f" | Error reading log file: {e} | ")  
+        return BaseResponse(status="FAILED", message=f" | Error reading log file: {e} | ", data=None)
+    
+@app.get("/speaker_audition")
+def speaker_audition(task_id: str, speaker_name: str):
+    """   
+    Get the audio file for a specific speaker in a task.  
+      
+    :param task_id: str  
+        The ID of the task to get the speaker audio for.  
+    :param speaker_name: str  
+        The name of the speaker whose audio file is requested.  
+    :return: BaseResponse or FileResponse  
+        The audio file if found, otherwise an error response.  
+    """  
+    output_path = os.path.join(OUTPUTPATH, task_id)  
+    if not os.path.exists(output_path):  
+        logger.error(f" | Please check the task ID is correct | ")  
+        return BaseResponse(status="FAILED", message=f" | Please check the task ID is correct | ", data=False)  
+    
+    audio_file = os.path.join(SPEAKERFOLDER, speaker_name)  
+    
+    if not os.path.isfile(audio_file):  
+        logger.error(f" | Audio file for speaker '{speaker_name}' not found in task '{task_id}' | ")  
+        return BaseResponse(status="FAILED", message=f" | Audio file for speaker '{speaker_name}' not found in task '{task_id}' | ", data=False)  
+    
+    logger.info(f" | Found audio file for speaker '{speaker_name}' in task '{task_id}' | ")  
+    return FileResponse(audio_file, media_type='audio/wav', filename=os.path.basename(audio_file))
+
+@app.get("/check_single_generate_service_permission")
+def check_single_generate_service_permission(task_id: str):
+    if task_id not in single_generate_state["usage_list"]:
+        logger.info(f" | task '{task_id}' not in usage list | ")
+        return BaseResponse(status="OK", message=f" | task '{task_id}' not in usage list | ", data=False)
+    else:
+        logger.info(f" | task '{task_id}' in usage list | ")
+        return BaseResponse(status="OK", message=f" | task '{task_id}' in usage list | ", data=True)
+
+@app.post("/cleanup_inactive_tasks")
+def cleanup_inactive_tasks():
+    """
+    Manually trigger cleanup of inactive tasks in usage_list.
+    """
+    try:
+        initial_count = len(single_generate_state["usage_list"])
+        check_and_cleanup_inactive_tasks()
+        final_count = len(single_generate_state["usage_list"])
+        removed_count = initial_count - final_count
+        
+        return BaseResponse(
+            status="OK", 
+            message=f" | Cleanup completed. Removed {removed_count} inactive tasks | ", 
+            data={
+                "initial_count": initial_count,
+                "final_count": final_count,
+                "removed_count": removed_count,
+                "current_usage_list": single_generate_state["usage_list"]
+            }
+        )
+    except Exception as e:
+        logger.error(f" | Error during manual cleanup: {e} | ")
+        return BaseResponse(status="FAILED", message=f" | Error during manual cleanup: {e} | ", data=False)
+
+    
+##############################################################################  
+
+def check_and_cleanup_inactive_tasks():
+    """
+    Check for inactive tasks in usage_list and remove them if their readied_audio 
+    state hasn't changed for more than 1 hour.
+    """
+    current_time = datetime.now()
+    tasks_to_remove = []
+    
+    # Get current state of readied_audio for each task
+    current_state = {}
+    for ready_file in single_generate_state["readied_audio"]:
+        for task_id in ready_file.keys():
+            if task_id in single_generate_state["usage_list"]:
+                current_state[task_id] = ready_file[task_id]
+    
+    # Check for tasks in usage_list that don't have readied_audio
+    for task_id in single_generate_state["usage_list"]:
+        if task_id not in current_state:
+            current_state[task_id] = None
+    
+    # Check each task in usage_list
+    for task_id in single_generate_state["usage_list"]:
+        if task_id not in usage_list_history:
+            # First time seeing this task, record its state
+            usage_list_history[task_id] = {
+                "last_check_time": current_time,
+                "last_audio_state": current_state.get(task_id),
+                "state_unchanged_since": current_time
+            }
+        else:
+            # Task exists in history, check if state changed
+            last_audio_state = usage_list_history[task_id]["last_audio_state"]
+            current_audio_state = current_state.get(task_id)
+            
+            if last_audio_state == current_audio_state:
+                # State hasn't changed, check if it's been more than 1 hour
+                time_since_last_change = current_time - usage_list_history[task_id]["state_unchanged_since"]
+                if time_since_last_change.total_seconds() >= 3600:  # 1 hour = 3600 seconds
+                    logger.info(f" | Task '{task_id}' has been inactive for {time_since_last_change}, marking for removal | ")
+                    tasks_to_remove.append(task_id)
+            else:
+                # State changed, update the history
+                usage_list_history[task_id]["last_audio_state"] = current_audio_state
+                usage_list_history[task_id]["state_unchanged_since"] = current_time
+            
+            usage_list_history[task_id]["last_check_time"] = current_time
+    
+    # Remove inactive tasks
+    for task_id in tasks_to_remove:
+        try:
+            if task_id in single_generate_state["usage_list"]:
+                single_generate_state["usage_list"].remove(task_id)
+                logger.info(f" | Removed inactive task '{task_id}' from usage list | ")
+            
+            # Clean up history for removed task
+            if task_id in usage_list_history:
+                del usage_list_history[task_id]
+                
+            # Clean up readied_audio for removed task
+            single_generate_state["readied_audio"] = [
+                ready_file for ready_file in single_generate_state["readied_audio"] 
+                if task_id not in ready_file
+            ]
+            
+        except Exception as e:
+            logger.error(f" | Error removing inactive task '{task_id}': {e} | ")
+    
+    # Clean up history for tasks no longer in usage_list
+    tasks_in_history = list(usage_list_history.keys())
+    for task_id in tasks_in_history:
+        if task_id not in single_generate_state["usage_list"]:
+            del usage_list_history[task_id]
+    
+    # If no tasks remain in usage_list, stop the single generate service
+    if single_generate_state["usage_list"] == [] and single_generate_state["conn"] is not None:
+        logger.info(" | No tasks remaining in usage list, stopping single generate service | ")
+        try:
+            stop_info = stop_task("auto_cleanup", [single_generate_state["conn"]], [None])
+            if not stop_info:
+                logger.info(" | Single generate service stopped automatically | ")
+        except Exception as e:
+            logger.error(f" | Error stopping single generate service: {e} | ")
+
 # Clean up audio files  
 def delete_old_audio_files():  
     """   
@@ -801,20 +1013,42 @@ def delete_old_audio_files():
                 if current_time - file_creation_time > 24 * 60 * 60:  
                     os.remove(file_path)  
                     logger.info(f"Deleted old file: {file_path}")  
+                    
+    for csv_file in os.listdir(CSV_TMP):
+        if csv_file.endswith("_generated.csv"):
+            file_path = os.path.join(CSV_TMP, csv_file)
+            if os.path.isfile(file_path):
+                file_creation_time = os.path.getctime(file_path)
+                os.remove(file_path)
+                logger.info(f"Deleted old CSV file: {file_path}")
+    
   
 # Daily task scheduling  
 def schedule_daily_task(stop_event, local_now):  
     """   
-    Schedule a daily cleanup task that removes outdated audio files at midnight.  
+    Schedule a daily cleanup task that removes outdated audio files at midnight,
+    and hourly cleanup of inactive tasks from usage_list.
       
     :param stop_event: threading.Event  
         A signal used to stop the scheduled task gracefully.  
     """  
+    last_hour_check = local_now.hour
+    
     while not stop_event.is_set():  
-        if local_now.hour == 0 and local_now.minute == 0:  
+        current_time = datetime.now(pytz.timezone('Asia/Taipei'))
+        
+        # Daily cleanup at midnight
+        if current_time.hour == 0 and current_time.minute == 0:  
             delete_old_audio_files()  
             time.sleep(60)  # Prevent triggering multiple times within the same minute  
-        time.sleep(1)  
+        
+        # Hourly cleanup of inactive tasks
+        if current_time.hour != last_hour_check:
+            logger.info(f" | Starting hourly cleanup of inactive tasks at {current_time.strftime('%Y-%m-%d %H:%M:%S')} | ")
+            check_and_cleanup_inactive_tasks()
+            last_hour_check = current_time.hour
+            
+        time.sleep(60)  # Check every minute  
     
 # Signal handler for graceful shutdown  
 def handle_exit(sig, frame):  
