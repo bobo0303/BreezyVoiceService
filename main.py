@@ -1,4 +1,4 @@
-from fastapi import FastAPI, UploadFile, File, Form  
+from fastapi import FastAPI, UploadFile, File, Form, HTTPException
 from fastapi.responses import HTMLResponse, FileResponse  
 from fastapi.middleware.cors import CORSMiddleware  
 import re  
@@ -11,6 +11,7 @@ import time
 import random
 import shutil  
 import signal  
+import hashlib
 import zipfile  
 import uvicorn  
 import subprocess  
@@ -23,7 +24,7 @@ from watchdog.observers import Observer
 from api.threading_api import process_batch_task, quality_checking_task, start_service, NewAudioCreate
 from api.utils import load_file_list, zip_wav_files, state_check, stop_task, split_csv
 
-from lib.constant import OUTPUTPATH, CSV_TMP, LOGPATH, CSV_HEADER_FORMAT, SPEAKERFOLDER, CUSTOMSPEAKERPATH, SPEAKERS, QUALITY_PASS_TXT, QUALITY_FAIL_TXT
+from lib.constant import OUTPUTPATH, CSV_TMP, LOGPATH, CSV_HEADER_FORMAT, SPEAKERFOLDER, CUSTOMSPEAKERPATH, SPEAKERS, QUALITY_PASS_TXT, QUALITY_FAIL_TXT, OpenAITTSRequest
 from lib.base_object import BaseResponse  
 from lib.log_config import setup_sys_logging  
 
@@ -857,11 +858,6 @@ def speaker_audition(task_id: str, speaker_name: str):
     :return: BaseResponse or FileResponse  
         The audio file if found, otherwise an error response.  
     """  
-    output_path = os.path.join(OUTPUTPATH, task_id)  
-    if not os.path.exists(output_path):  
-        logger.error(f" | Please check the task ID is correct | ")  
-        return BaseResponse(status="FAILED", message=f" | Please check the task ID is correct | ", data=False)  
-    
     audio_file = os.path.join(SPEAKERFOLDER, speaker_name)  
     
     if not os.path.isfile(audio_file):  
@@ -1049,16 +1045,222 @@ def schedule_daily_task(stop_event, local_now):
             last_hour_check = current_time.hour
             
         time.sleep(60)  # Check every minute  
+        
+###############################################################################
+###################### This is for OpenAI compatible TTS ######################
+###############################################################################
+
+@app.post("/v1/audio/speech")
+async def openai_compatible_tts(request: OpenAITTSRequest):
+    """
+    OpenAI compatible TTS endpoint for Open Notebook integration.
+    
+    Compatible with OpenAI's /v1/audio/speech API format.
+    """
+    try:
+        # 使用固定的 task_id
+        task_id = "openai_NB_TTS"
+        
+        # 記錄請求
+        logger.info(f" | OpenAI TTS request | task_id: {task_id} | voice: {request.voice} | text length: {len(request.input)} | ")
+        
+        # 確保 service 啟動
+        if task_id not in single_generate_state["usage_list"]:
+            single_generate_state["usage_list"].append(task_id)
+        
+        sg_state = start_service(task_id, single_generate_state)
+        if isinstance(sg_state, BaseResponse):
+            raise HTTPException(status_code=500, detail=sg_state.message)
+        
+        # 加載 speakers
+        try:
+            with open(SPEAKERS, 'r') as speakers_file:
+                speakers = json.load(speakers_file)
+        except Exception as e:
+            logger.error(f" | Error reading speakers file: {e} | ")
+            raise HTTPException(status_code=500, detail=f"Error loading speakers: {e}")
+        
+        # 加載所有 custom speakers (遍歷 CUSTOMSPEAKERPATH 目錄下的所有 JSON 文件)
+        if os.path.isdir(CUSTOMSPEAKERPATH):
+            for custom_file in os.listdir(CUSTOMSPEAKERPATH):
+                if custom_file.endswith('.json'):
+                    custom_speaker_json = os.path.join(CUSTOMSPEAKERPATH, custom_file)
+                    try:
+                        with open(custom_speaker_json, 'r') as speakers_file:
+                            custom_speakers = json.load(speakers_file)
+                            speakers.extend(custom_speakers)
+                    except Exception as e:
+                        logger.warning(f" | Error loading custom speaker file {custom_file}: {e} | ")
+        
+        # 查找 speaker text
+        speaker_text = next(
+            (speaker['sentence'] for speaker in speakers if request.voice == speaker['audio']),
+            None
+        )
+        
+        if not speaker_text:
+            # 如果沒找到完整匹配,嘗試模糊匹配 (去掉 .wav 後綴)
+            voice_name = request.voice.replace('.wav', '')
+            speaker_text = next(
+                (speaker['sentence'] for speaker in speakers 
+                 if voice_name in speaker['audio'] or speaker['audio'].replace('.wav', '') == voice_name),
+                None
+            )
+        
+        if not speaker_text:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Voice '{request.voice}' not found. Available voices: {[s['audio'] for s in speakers[:5]]}"
+            )
+        
+        # 生成輸出文件名
+        now = datetime.now()
+        current_time = now.strftime("%Y%m%d_%H%M%S")
+        output_name = f"{task_id}_{current_time}.wav"
+        
+        # 構建生成任務
+        info = {
+            "task_id": task_id,
+            "speaker": request.voice if request.voice.endswith('.wav') else f"{request.voice}.wav",
+            "speaker_text": speaker_text,
+            "text": request.input,
+            "output_name": output_name,
+        }
+        
+        # 提交任務到隊列
+        if single_generate_state["task_queue"] is None:
+            raise HTTPException(status_code=500, detail="TTS service not ready")
+        
+        single_generate_state["task_queue"].put(info)
+        logger.info(f" | OpenAI TTS task queued | task_id: {task_id} | ")
+        
+        # 等待音頻生成完成 (同步等待,最多 60 秒)
+        max_wait_time = 60  # 秒
+        check_interval = 0.5  # 秒
+        waited = 0
+        
+        while waited < max_wait_time:
+            time.sleep(check_interval)
+            waited += check_interval
+            
+            # 檢查是否有新的音頻完成 (從 audio_queue 獲取)
+            logger.debug(f" | Checking queue, waited: {waited}s | ")
+            if single_generate_state["audio_queue"] and not single_generate_state["audio_queue"].empty():
+                try:
+                    audio_info = single_generate_state["audio_queue"].get_nowait()
+                    # audio_info 已經是 dict 格式: {task_id: audio_path}
+                    single_generate_state["readied_audio"].append(audio_info)
+                    logger.info(f" | Received audio from queue: {audio_info} | ")
+                except Exception as e:
+                    logger.error(f" | Queue get error: {e} | ")
+            
+            # 檢查是否是我們要的音頻
+            for ready_file in single_generate_state["readied_audio"]:
+                if task_id in ready_file:
+                    audio_path = ready_file[task_id]
+                    logger.info(f" | OpenAI TTS completed | audio: {os.path.basename(audio_path)} | ")
+                    
+                    # 從 readied_audio 中移除已返回的音檔，避免重複返回
+                    single_generate_state["readied_audio"].remove(ready_file)
+                    
+                    # 返回音頻文件
+                    return FileResponse(
+                        audio_path,
+                        media_type='audio/wav',
+                        filename=output_name,
+                        headers={
+                            "Content-Disposition": f"attachment; filename={output_name}"
+                        }
+                    )
+        
+        # 超時
+        logger.warning(f" | OpenAI TTS timeout | task_id: {task_id} | ")
+        raise HTTPException(status_code=504, detail="TTS generation timeout")
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f" | OpenAI TTS error: {e} | ")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/v1/models")
+async def list_openai_models():
+    """
+    List available TTS models (OpenAI compatible).
+    """
+    return {
+        "object": "list",
+        "data": [
+            {
+                "id": "breezyvoice-zh",
+                "object": "model",
+                "created": int(time.time()),
+                "owned_by": "breezyvoice",
+                "permission": [],
+                "root": "breezyvoice-zh",
+                "parent": None,
+            }
+        ]
+    }
+
+
+@app.get("/v1/voices")
+async def list_available_voices():
+    """
+    List all available voices (speakers).
+    Useful for Open Notebook to discover available voices.
+    """
+    try:
+        with open(SPEAKERS, 'r') as speakers_file:
+            speakers = json.load(speakers_file)
+        
+        voices = [
+            {
+                "voice_id": speaker['audio'],
+                "name": speaker['audio'].replace('.wav', ''),
+                "preview_url": None,
+                "description": speaker.get('sentence', '')[:50] + "..."
+            }
+            for speaker in speakers
+        ]
+        
+        return {
+            "voices": voices,
+            "count": len(voices)
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+    
+##############################################################################
     
 # Signal handler for graceful shutdown  
 def handle_exit(sig, frame):  
     """   
     Handle system exit signals (SIGINT, SIGTERM) to gracefully shut down the daily task scheduler.  
     """  
+    logger.info("Received shutdown signal, cleaning up...")
     stop_event.set()  
-    task_thread.join()  
-    if single_generate_state["usage_list"] != []:
-        single_generate_state["process"].join()
+    task_thread.join(timeout=5)  
+    
+    # 終止子進程
+    if single_generate_state["process"] is not None:
+        try:
+            single_generate_state["process"].terminate()
+            single_generate_state["process"].join(timeout=3)
+            if single_generate_state["process"].is_alive():
+                single_generate_state["process"].kill()
+                logger.info("Force killed single generate process.")
+        except Exception as e:
+            logger.error(f"Error terminating process: {e}")
+    
+    # 關閉連接
+    if single_generate_state["conn"] is not None:
+        try:
+            single_generate_state["conn"].close()
+        except Exception:
+            pass
+            
     logger.info("Scheduled task has been stopped.")  
     os._exit(0)  
 

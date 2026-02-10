@@ -1,4 +1,5 @@
 
+from typing import Optional
 from pydantic import BaseModel
 from enum import Enum
 import torch
@@ -46,5 +47,15 @@ class Common(Enum):
     STOP: str = "stop"
     STATE: str = "state"
     
+#############################################################################
+
+# OpenAI Compatible TTS Request Model
+class OpenAITTSRequest(BaseModel):
+    input: str  # TTS text
+    model: str  # model name (Default: breezyvoice-zh)
+    voice: str  # voice ID (e.g., "speaker_001.wav")
+    response_format: Optional[str] = "wav"  # audio format
+    speed: Optional[float] = 1.0  # speech speed (optional)
+
 #############################################################################
 
