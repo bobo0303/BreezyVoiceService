@@ -1154,24 +1154,26 @@ async def openai_compatible_tts(request: OpenAITTSRequest):
                 except Exception as e:
                     logger.error(f" | Queue get error: {e} | ")
             
-            # 檢查是否是我們要的音頻
+            # 檢查是否是我們要的音頻 (用 output_name 精確匹配)
             for ready_file in single_generate_state["readied_audio"]:
                 if task_id in ready_file:
                     audio_path = ready_file[task_id]
-                    logger.info(f" | OpenAI TTS completed | audio: {os.path.basename(audio_path)} | ")
-                    
-                    # 從 readied_audio 中移除已返回的音檔，避免重複返回
-                    single_generate_state["readied_audio"].remove(ready_file)
-                    
-                    # 返回音頻文件
-                    return FileResponse(
-                        audio_path,
-                        media_type='audio/wav',
-                        filename=output_name,
-                        headers={
-                            "Content-Disposition": f"attachment; filename={output_name}"
-                        }
-                    )
+                    # 用 output_name 精確匹配，確保是這次請求生成的音檔
+                    if audio_path.endswith(output_name):
+                        logger.info(f" | OpenAI TTS completed | audio: {os.path.basename(audio_path)} | ")
+                        
+                        # 從 readied_audio 中移除已返回的音檔，避免重複返回
+                        single_generate_state["readied_audio"].remove(ready_file)
+                        
+                        # 返回音頻文件
+                        return FileResponse(
+                            audio_path,
+                            media_type='audio/wav',
+                            filename=output_name,
+                            headers={
+                                "Content-Disposition": f"attachment; filename={output_name}"
+                            }
+                        )
         
         # 超時
         logger.warning(f" | OpenAI TTS timeout | task_id: {task_id} | ")
@@ -1232,7 +1234,149 @@ async def list_available_voices():
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
     
+    
+###############################################################################
+########################### This is for Bobo Agent ############################
+###############################################################################
+
+@app.post("/bobo/single_generate")
+async def bobo_single_generate(
+    task_id: str = Form(...),
+    speaker_name: str = Form(...),
+    text: str = Form(...),
+    timeout: int = Form(60),  # 可選的超時時間，默認 60 秒
+):
+    """
+    單次生成音頻並等待結果返回。
+    專門給 Bobo Agent 服務使用，發送請求後會同步等待音頻生成完成才返回。
+    
+    :param task_id: 任務 ID
+    :param speaker_name: 語者名稱 (例如: jack10.wav)
+    :param text: 要合成的文字
+    :param timeout: 超時時間 (秒)，默認 60 秒
+    :return: 生成的音頻文件
+    """
+    try:
+        # 確保 service 啟動
+        if task_id not in single_generate_state["usage_list"]:
+            single_generate_state["usage_list"].append(task_id)
+        
+        sg_state = start_service(task_id, single_generate_state)
+        if isinstance(sg_state, BaseResponse):
+            return sg_state
+        
+        # 加載 speakers
+        try:
+            with open(SPEAKERS, 'r') as speakers_file:
+                speakers = json.load(speakers_file)
+        except Exception as e:
+            logger.error(f" | Error reading speakers file: {e} | ")
+            return BaseResponse(status="FAILED", message=f" | Error reading speakers file: {e} | ", data=False)
+        
+        # 加載所有 custom speakers
+        if os.path.isdir(CUSTOMSPEAKERPATH):
+            for custom_file in os.listdir(CUSTOMSPEAKERPATH):
+                if custom_file.endswith('.json'):
+                    custom_speaker_json = os.path.join(CUSTOMSPEAKERPATH, custom_file)
+                    try:
+                        with open(custom_speaker_json, 'r') as speakers_file:
+                            custom_speakers = json.load(speakers_file)
+                            speakers.extend(custom_speakers)
+                    except Exception as e:
+                        logger.warning(f" | Error loading custom speaker file {custom_file}: {e} | ")
+        
+        # 查找 speaker text
+        speaker_text = next(
+            (speaker['sentence'] for speaker in speakers if speaker_name == speaker['audio']),
+            None
+        )
+        
+        if not speaker_text:
+            # 嘗試模糊匹配
+            voice_name = speaker_name.replace('.wav', '')
+            speaker_text = next(
+                (speaker['sentence'] for speaker in speakers 
+                 if voice_name in speaker['audio'] or speaker['audio'].replace('.wav', '') == voice_name),
+                None
+            )
+        
+        if not speaker_text:
+            logger.error(f" | Can't find speaker text with provided speaker '{speaker_name}' | ")
+            return BaseResponse(status="FAILED", message=f" | Can't find speaker text with provided speaker '{speaker_name}' | ", data=False)
+        
+        # 生成輸出文件名
+        now = datetime.now()
+        current_time = now.strftime("%Y-%m-%d_%H-%M-%S")
+        speaker_base = speaker_name[:-4] if speaker_name.endswith('.wav') else speaker_name
+        output_name = f"{task_id}_{speaker_base}_{current_time}.wav"
+        
+        # 構建生成任務
+        info = {
+            "task_id": task_id,
+            "speaker": speaker_name if speaker_name.endswith('.wav') else f"{speaker_name}.wav",
+            "speaker_text": speaker_text,
+            "text": text,
+            "output_name": output_name,
+        }
+        
+        # 提交任務到隊列
+        if single_generate_state["task_queue"] is None:
+            logger.error(f" | single generate service not found | ")
+            return BaseResponse(status="FAILED", message=f" | single generate service not found | ", data=False)
+        
+        single_generate_state["task_queue"].put(info)
+        logger.info(f" | Bobo Agent task '{task_id}' queued | speaker: {speaker_name} | ")
+        
+        # 等待音頻生成完成
+        check_interval = 0.5  # 秒
+        waited = 0
+        
+        while waited < timeout:
+            time.sleep(check_interval)
+            waited += check_interval
+            
+            # 從 audio_queue 獲取完成的音頻
+            if single_generate_state["audio_queue"] and not single_generate_state["audio_queue"].empty():
+                try:
+                    audio_info = single_generate_state["audio_queue"].get_nowait()
+                    current_task_id = next(iter(audio_info))
+                    
+                    # 直接添加到 readied_audio，不覆蓋舊的
+                    single_generate_state["readied_audio"].append(audio_info)
+                    
+                    logger.info(f" | Received audio from queue: {audio_info} | ")
+                except Exception as e:
+                    logger.error(f" | Queue get error: {e} | ")
+            
+            # 檢查是否是我們要的音頻 (用 output_name 精確匹配)
+            for ready_file in single_generate_state["readied_audio"]:
+                if task_id in ready_file:
+                    audio_path = ready_file[task_id]
+                    # 用 output_name 精確匹配，確保是這次請求生成的音檔
+                    if audio_path.endswith(output_name):
+                        logger.info(f" | Bobo Agent task completed | audio: {os.path.basename(audio_path)} | ")
+                        
+                        # 從 readied_audio 中移除已返回的音檔
+                        single_generate_state["readied_audio"].remove(ready_file)
+                        
+                        # 返回音頻文件
+                        return FileResponse(
+                            audio_path,
+                            media_type='audio/wav',
+                            filename=output_name
+                        )
+        
+        # 超時
+        logger.warning(f" | Bobo Agent task '{task_id}' timeout after {timeout}s | ")
+        return BaseResponse(status="FAILED", message=f" | task '{task_id}' timeout after {timeout}s | ", data=False)
+        
+    except Exception as e:
+        logger.error(f" | Bobo Agent error: {e} | task_id: {task_id} | ")
+        return BaseResponse(status="FAILED", message=f" | An error occurred: {e} | ", data=False)
+
+    
 ##############################################################################
+
     
 # Signal handler for graceful shutdown  
 def handle_exit(sig, frame):  
